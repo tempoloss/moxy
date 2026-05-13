@@ -6,8 +6,10 @@ import (
 	"github.com/an8kk/moxy/internal/task"
 )
 
-var ErrQueueEmpty = errors.New("ready queue is empty")
-var ErrTaskNotProcessing = errors.New("task is not processing")
+var (
+	ErrQueueEmpty        = errors.New("ready queue is empty")
+	ErrTaskNotProcessing = errors.New("task is not processing")
+)
 
 // Stats reports queue-owned task counts.
 type Stats struct {

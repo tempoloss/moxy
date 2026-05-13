@@ -32,4 +32,13 @@ jobs:
       - name: Stress core tests
         run: go test ./internal/core -count=100
 
+      - name: Stress queue tests
+        run: go test ./internal/queue -count=100
+
+      - name: Stress service tests
+        run: go test ./internal/service -count=100
+
+      - name: Stress command tests
+        run: go test ./internal/command -count=100
+
       # Race tests are intentionally deferred until the local Windows setup has cgo/GCC available.

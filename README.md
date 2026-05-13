@@ -1,80 +1,202 @@
 # Moxy
 
-Moxy is a stateful reliability middleware for Redis-style queues.
+[![Go](https://github.com/an8kk/Moxy/actions/workflows/go.yml/badge.svg)](https://github.com/an8kk/Moxy/actions/workflows/go.yml)
 
-Moxy currently provides a deterministic in-memory lease engine with at-least-once delivery semantics. Tasks can be delivered more than once, but active work should not silently disappear when a worker fails to acknowledge a lease.
-
-## Current Lifecycle
+Moxy is a reliability layer for Redis-style queues. It turns fragile pop-and-forget
+delivery into leased, acknowledged, at-least-once delivery:
 
 ```text
 READY -> PROCESSING -> ACKED
 READY -> PROCESSING -> EXPIRED -> REQUEUED -> READY
 ```
 
-Active leases are metadata owned by the core engine. Task storage is owned by the queue backend, which tracks ready and processing tasks. ACK completes a processing task; expiration requeues a processing task back to ready.
+The project is intentionally being built from the inside out. The current codebase
+does not proxy Redis traffic yet; it first establishes the core correctness model:
+tasks are either ready, processing, or completed, and expired leases return work to
+the ready queue instead of letting it disappear.
 
-## Internal Layers
+## Why Moxy Exists
 
-`core.Engine` remains a single-queue lease coordinator. `service.Service` manages multiple named queues by lazily creating one engine per queue from a backend factory. `command.Handler` provides a protocol-neutral command layer over the service.
+Plain queue consumption with `LPOP` can lose work:
 
-Supported internal commands:
+1. A worker pops a task.
+2. The worker crashes before completing it.
+3. Redis has already removed the task.
+4. The task silently disappears.
 
-- `MOXY.ENQUEUE queue payload`
-- `MOXY.FETCH queue timeout_ms`
-- `MOXY.ACK lease_id`
-- `MOXY.STATS queue`
+Moxy prevents that class of loss by separating task storage from lease ownership.
+Workers fetch a lease, acknowledge it when the task is done, and the reaper returns
+expired leases back to ready storage.
 
-These are plain Go command values today. TCP, RESP, and Redis protocol handling are intentionally not implemented yet.
+## What Works Today
 
-## Current Scope
+- In-memory queue backend with `READY` and `PROCESSING` storage.
+- Redis queue backend using `go-redis/v9`.
+- Atomic Redis `Complete` and `Requeue` operations with Lua scripts.
+- Single-queue lease coordinator in `internal/core`.
+- Multi-queue service layer in `internal/service`.
+- Protocol-neutral command handler in `internal/command`.
+- Background expiration reaper.
+- Shared backend contract tests for MemoryQueue and RedisQueue.
+- Opt-in Redis integration tests.
 
-Implemented:
+## Architecture
 
-- In-memory queue backend with ready and processing sets
-- Redis queue backend for integration use
-- Leased task delivery
-- Lease acknowledgments
-- Expiration scheduling with `container/heap`
-- Lazy invalidation of stale heap entries
-- Delayed retry scheduling when expiration requeue fails
-- Expiration reaping back into ready storage
-- A simple background reaper
-- Multi-queue service layer
-- Protocol-neutral internal command handler
+```mermaid
+flowchart LR
+    Command["internal/command<br/>Protocol-neutral commands"]
+    Service["internal/service<br/>Multiple named queues"]
+    Core["internal/core<br/>Lease coordination"]
+    Queue["internal/queue<br/>Backend interface"]
+    Memory["MemoryQueue"]
+    Redis["RedisQueue"]
 
-Not implemented yet:
+    Command --> Service
+    Service --> Core
+    Core --> Queue
+    Queue --> Memory
+    Queue --> Redis
+```
 
-- Redis protocol support
-- RESP parsing
-- TCP proxying
-- WAL or snapshot crash recovery
-- Redis Streams
-- Distributed coordination
+`core.Engine` deliberately coordinates one queue. `service.Service` owns the map of
+queue names to engines. Queue backends own task storage; the core engine owns lease
+metadata and expiration scheduling.
 
-## Try It
+See [ARCHITECTURE.md](ARCHITECTURE.md) for more detail.
+
+## Internal Commands
+
+The command layer is a Go API, not a network protocol. It exists so the eventual
+TCP/RESP layer can be thin.
+
+Supported commands:
+
+```text
+MOXY.ENQUEUE queue payload
+MOXY.FETCH queue timeout_ms
+MOXY.ACK lease_id
+MOXY.STATS queue
+```
+
+Example flow:
+
+```go
+svc := service.New(func(queueName string) queue.Backend {
+	return queue.NewMemoryQueue()
+})
+handler := command.NewHandler(svc)
+
+enqueue, _ := handler.Handle(command.Command{
+	Name: "MOXY.ENQUEUE",
+	Args: []string{"emails", "send welcome email"},
+})
+
+fetch, _ := handler.Handle(command.Command{
+	Name: "MOXY.FETCH",
+	Args: []string{"emails", "30000"},
+})
+
+_, _ = handler.Handle(command.Command{
+	Name: "MOXY.ACK",
+	Args: []string{fetch.LeaseID},
+})
+
+_ = enqueue
+```
+
+## Backends
+
+### MemoryQueue
+
+`MemoryQueue` is the default backend used by `core.NewEngine` and the demo binary.
+It is deterministic, easy to test, and useful for validating lease behavior.
+
+### RedisQueue
+
+`RedisQueue` stores ready and processing tasks in Redis lists:
+
+- `moxy:{queue}:ready`
+- `moxy:{queue}:processing`
+
+`Acquire` uses `LMOVE ready processing RIGHT LEFT`. `Complete` and `Requeue` use Lua
+scripts so finding a task by ID and removing or moving it happens atomically inside
+Redis.
+
+```go
+client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+backend := queue.NewRedisQueue(client, "emails")
+```
+
+## Quickstart
 
 ```sh
 go test ./...
 go run ./cmd/moxy
 ```
 
-MemoryQueue is the default backend used by the demo and core engine constructor. RedisQueue is available as another `queue.Backend` implementation for integration use:
+The demo runs a short command-layer scenario with `MemoryQueue`.
 
-```go
-client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-backend := queue.NewRedisQueue(client, "default")
+## Redis Integration Tests
+
+Redis tests are opt-in so normal development does not require a running Redis
+server.
+
+PowerShell:
+
+```powershell
+$env:MOXY_REDIS_INTEGRATION='1'
+$env:MOXY_REDIS_ADDR='localhost:6379'
+go test ./internal/queue -run Redis -count=1 -v
+go test ./internal/core -run Redis -count=1 -v
 ```
 
-Redis integration tests are opt-in:
+Shell:
 
 ```sh
-MOXY_REDIS_INTEGRATION=1 MOXY_REDIS_ADDR=localhost:6379 go test ./internal/queue -run Redis -count=1 -v
+MOXY_REDIS_INTEGRATION=1 MOXY_REDIS_ADDR=localhost:6379 \
+  go test ./internal/queue -run Redis -count=1 -v
 ```
 
-RedisQueue uses JSON serialization and Redis lists. `Acquire` uses `LMOVE`; `Complete` and `Requeue` use Lua scripts so finding the processing task and moving/removing it happens atomically inside Redis.
+## Development Checks
 
-Moxy is still single-node and backend-adapter based. Phase 3.5 does not include TCP proxying, RESP parsing, WAL, snapshots, crash recovery, Redis Streams, distributed behavior, or user-facing protocol commands.
+```sh
+go mod tidy
+go test ./...
+go vet ./...
+go test ./internal/core -count=100
+go test ./internal/queue -count=100
+go test ./internal/service -count=100
+go test ./internal/command -count=100
+```
 
-Phase 4 adds only an internal service and command layer. It still does not include TCP, RESP, Redis proxying, WAL, snapshots, crash recovery, Redis Streams, distributed behavior, or user-facing network protocol commands.
+Race testing is deferred until the local Windows development environment has
+cgo/GCC available.
 
-Race testing is intentionally deferred until the local Windows development environment has cgo/GCC available.
+## License
+
+Moxy is released under the [MIT License](LICENSE).
+
+## Non-Goals For This Phase
+
+Moxy is still single-node and backend-adapter based. The following are intentionally
+not implemented yet:
+
+- TCP server
+- RESP parser
+- Redis proxying
+- WAL
+- snapshots
+- crash recovery
+- Redis Streams
+- distributed coordination
+- user-facing network protocol commands
+
+## Roadmap
+
+- Keep hardening the command/service boundary.
+- Add observability-friendly stats and structured errors.
+- Introduce TCP/RESP once the internal command model is stable.
+- Add persistence and crash recovery after the in-memory semantics remain boring.
+
+The boring part is the point: a queue reliability layer should be legible,
+testable, and conservative before it becomes networked.

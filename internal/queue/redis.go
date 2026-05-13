@@ -25,6 +25,7 @@ func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
 	}
 }
 
+// Enqueue serializes a task and appends it to Redis ready storage.
 func (q *RedisQueue) Enqueue(task task.Task) error {
 	encoded, err := encodeTask(task)
 	if err != nil {
@@ -34,6 +35,7 @@ func (q *RedisQueue) Enqueue(task task.Task) error {
 	return q.client.LPush(context.Background(), q.readyKey, encoded).Err()
 }
 
+// Acquire atomically moves one task from ready to processing storage.
 func (q *RedisQueue) Acquire() (task.Task, error) {
 	encoded, err := q.client.LMove(context.Background(), q.readyKey, q.processingKey, "RIGHT", "LEFT").Result()
 	if errors.Is(err, redis.Nil) {
@@ -46,6 +48,7 @@ func (q *RedisQueue) Acquire() (task.Task, error) {
 	return decodeTask(encoded)
 }
 
+// Complete atomically removes a processing task.
 func (q *RedisQueue) Complete(taskID string) error {
 	found, err := q.runTaskScript(completeTaskScript, taskID)
 	if err != nil {
@@ -58,6 +61,7 @@ func (q *RedisQueue) Complete(taskID string) error {
 	return nil
 }
 
+// Requeue atomically moves a processing task back to ready storage.
 func (q *RedisQueue) Requeue(taskID string) error {
 	found, err := q.runTaskScript(requeueTaskScript, taskID)
 	if err != nil {
@@ -70,6 +74,7 @@ func (q *RedisQueue) Requeue(taskID string) error {
 	return nil
 }
 
+// Stats reports Redis ready and processing list lengths.
 func (q *RedisQueue) Stats() Stats {
 	ctx := context.Background()
 	ready := q.client.LLen(ctx, q.readyKey).Val()

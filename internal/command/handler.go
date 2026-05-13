@@ -15,6 +15,7 @@ var (
 	ErrInvalidTimeout   = errors.New("invalid timeout")
 )
 
+// Response is the command-layer result shape shared by all supported commands.
 type Response struct {
 	OK        bool
 	TaskID    string
@@ -24,23 +25,26 @@ type Response struct {
 	Stats     service.Stats
 }
 
+// Handler dispatches protocol-neutral commands into the service layer.
 type Handler struct {
 	service *service.Service
 }
 
+// NewHandler creates a command handler over a service.
 func NewHandler(service *service.Service) *Handler {
 	return &Handler{service: service}
 }
 
+// Handle validates and executes a Moxy command.
 func (h *Handler) Handle(command Command) (Response, error) {
 	switch strings.ToUpper(command.Name) {
-	case "MOXY.ENQUEUE":
+	case EnqueueName:
 		return h.handleEnqueue(command.Args)
-	case "MOXY.FETCH":
+	case FetchName:
 		return h.handleFetch(command.Args)
-	case "MOXY.ACK":
+	case AckName:
 		return h.handleAck(command.Args)
-	case "MOXY.STATS":
+	case StatsName:
 		return h.handleStats(command.Args)
 	default:
 		return Response{}, ErrUnknownCommand

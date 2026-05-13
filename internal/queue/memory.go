@@ -13,6 +13,7 @@ type MemoryQueue struct {
 	processing map[string]task.Task
 }
 
+// NewMemoryQueue creates an empty in-memory queue backend.
 func NewMemoryQueue() *MemoryQueue {
 	return &MemoryQueue{
 		ready:      make([]task.Task, 0),
@@ -20,6 +21,7 @@ func NewMemoryQueue() *MemoryQueue {
 	}
 }
 
+// Enqueue appends a task to ready storage.
 func (q *MemoryQueue) Enqueue(task task.Task) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -28,6 +30,7 @@ func (q *MemoryQueue) Enqueue(task task.Task) error {
 	return nil
 }
 
+// Acquire moves one ready task into processing storage.
 func (q *MemoryQueue) Acquire() (task.Task, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -46,6 +49,7 @@ func (q *MemoryQueue) Acquire() (task.Task, error) {
 	return cloneTask(next), nil
 }
 
+// Complete removes a processing task.
 func (q *MemoryQueue) Complete(taskID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -58,6 +62,7 @@ func (q *MemoryQueue) Complete(taskID string) error {
 	return nil
 }
 
+// Requeue moves a processing task back to ready storage.
 func (q *MemoryQueue) Requeue(taskID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -72,6 +77,7 @@ func (q *MemoryQueue) Requeue(taskID string) error {
 	return nil
 }
 
+// Stats reports ready and processing task counts.
 func (q *MemoryQueue) Stats() Stats {
 	q.mu.Lock()
 	defer q.mu.Unlock()

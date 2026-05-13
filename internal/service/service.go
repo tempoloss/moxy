@@ -13,16 +13,20 @@ import (
 
 var ErrInvalidQueueName = errors.New("queue name must not be empty")
 
+// BackendFactory creates a queue backend for one named queue.
 type BackendFactory func(queueName string) queue.Backend
 
+// Stats reports the state of one service-managed queue.
 type Stats = core.Stats
 
+// Service owns multiple named queues.
 type Service struct {
 	mu      sync.Mutex
 	factory BackendFactory
 	engines map[string]*core.Engine
 }
 
+// New creates a service that lazily creates engines from the backend factory.
 func New(factory BackendFactory) *Service {
 	return &Service{
 		factory: factory,
@@ -30,6 +34,7 @@ func New(factory BackendFactory) *Service {
 	}
 }
 
+// Enqueue appends a task payload to a named queue, creating the queue on demand.
 func (s *Service) Enqueue(queueName string, payload []byte) (task.Task, error) {
 	engine, err := s.engineFor(queueName)
 	if err != nil {
@@ -39,6 +44,7 @@ func (s *Service) Enqueue(queueName string, payload []byte) (task.Task, error) {
 	return engine.Enqueue(payload), nil
 }
 
+// Fetch leases one task from a named queue.
 func (s *Service) Fetch(queueName string, timeout time.Duration) (*core.Lease, error) {
 	engine, err := s.engineFor(queueName)
 	if err != nil {
@@ -48,6 +54,7 @@ func (s *Service) Fetch(queueName string, timeout time.Duration) (*core.Lease, e
 	return engine.Fetch(timeout)
 }
 
+// Ack completes a lease by scanning the service's existing queues.
 func (s *Service) Ack(leaseID string) error {
 	engines := s.existingEngines()
 	for _, engine := range engines {
@@ -63,6 +70,7 @@ func (s *Service) Ack(leaseID string) error {
 	return core.ErrLeaseNotFound
 }
 
+// ReapExpired reaps expired leases across all existing queues.
 func (s *Service) ReapExpired(now time.Time) (int, error) {
 	engines := s.existingEngines()
 	total := 0
@@ -78,6 +86,7 @@ func (s *Service) ReapExpired(now time.Time) (int, error) {
 	return total, errors.Join(errs...)
 }
 
+// Stats returns counts for a named queue.
 func (s *Service) Stats(queueName string) (Stats, bool) {
 	if !validQueueName(queueName) {
 		return Stats{}, false
