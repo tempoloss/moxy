@@ -171,7 +171,7 @@ func cleanupRedisQueue(t *testing.T, client *redis.Client, queue *RedisQueue) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := client.Del(ctx, queue.readyKey, queue.processingKey).Err(); err != nil {
+	if err := client.Del(ctx, queue.readyKey, queue.processingKey, queue.deadKey).Err(); err != nil {
 		t.Fatalf("cleanup redis queue: %v", err)
 	}
 }

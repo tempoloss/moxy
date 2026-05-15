@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/an8kk/moxy/internal/task"
 	"github.com/redis/go-redis/v9"
@@ -15,14 +16,43 @@ type RedisQueue struct {
 	client        *redis.Client
 	readyKey      string
 	processingKey string
+	deadKey       string
 }
 
 func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
+	keys := newRedisQueueKeys(queueName)
 	return &RedisQueue{
 		client:        client,
-		readyKey:      fmt.Sprintf("moxy:{%s}:ready", queueName),
-		processingKey: fmt.Sprintf("moxy:{%s}:processing", queueName),
+		readyKey:      keys.ready,
+		processingKey: keys.processing,
+		deadKey:       keys.dead,
 	}
+}
+
+type redisQueueKeys struct {
+	ready      string
+	processing string
+	dead       string
+}
+
+func newRedisQueueKeys(queueName string) redisQueueKeys {
+	hashTag := fmt.Sprintf("{%s}", queueName)
+	prefix := "moxy:" + hashTag
+	return redisQueueKeys{
+		ready:      prefix + ":ready",
+		processing: prefix + ":processing",
+		dead:       prefix + ":dead",
+	}
+}
+
+func redisHashTag(key string) string {
+	start := strings.IndexByte(key, '{')
+	end := strings.IndexByte(key, '}')
+	if start < 0 || end <= start {
+		return ""
+	}
+
+	return key[start : end+1]
 }
 
 // Enqueue serializes a task and appends it to Redis ready storage.
