@@ -273,7 +273,7 @@ implemented yet:
 - crash recovery
 - Redis Streams
 - distributed coordination
-- user-facing network protocol commands
+- additional Redis-compatible commands beyond `PING` and `MOXY.*`
 
 ## Roadmap
 
