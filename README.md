@@ -1,32 +1,73 @@
+<p align="center">
+  <img src="docs/assets/moxy-hero.svg" alt="Moxy leased queue reliability diagram" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/an8kk/Moxy/actions/workflows/go.yml"><img alt="Go" src="https://github.com/an8kk/Moxy/actions/workflows/go.yml/badge.svg"></a>
+  <a href="https://goreportcard.com/report/github.com/an8kk/Moxy"><img alt="Go Report" src="https://goreportcard.com/badge/github.com/an8kk/Moxy"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/an8kk/Moxy"></a>
+  <img alt="Status" src="https://img.shields.io/badge/status-pre--proxy%20core-21d4a8">
+</p>
+
 # Moxy
 
-[![Go](https://github.com/an8kk/Moxy/actions/workflows/go.yml/badge.svg)](https://github.com/an8kk/Moxy/actions/workflows/go.yml)
-
-Moxy is a reliability layer for Redis-style queues. It turns fragile pop-and-forget
-delivery into leased, acknowledged, at-least-once delivery:
+Moxy is a reliability layer for Redis-style queues. It adds leases, ACKs,
+visibility timeouts, and expiration recovery so tasks do not silently disappear
+when a worker dies.
 
 ```text
 READY -> PROCESSING -> ACKED
 READY -> PROCESSING -> EXPIRED -> REQUEUED -> READY
 ```
 
-The project is intentionally being built from the inside out. The current codebase
-does not proxy Redis traffic yet; it first establishes the core correctness model:
-tasks are either ready, processing, or completed, and expired leases return work to
-the ready queue instead of letting it disappear.
+Moxy is being built from the inside out: first the correctness model, then the
+network/protocol layer. The current repo is already useful as a compact Go
+reference for reliable queue internals.
 
-## Why Moxy Exists
+## The Pain
 
-Plain queue consumption with `LPOP` can lose work:
+Plain Redis list consumption often starts with `LPOP`. It is fast, simple, and
+dangerous:
 
 1. A worker pops a task.
 2. The worker crashes before completing it.
 3. Redis has already removed the task.
-4. The task silently disappears.
+4. The task is gone.
 
-Moxy prevents that class of loss by separating task storage from lease ownership.
-Workers fetch a lease, acknowledge it when the task is done, and the reaper returns
-expired leases back to ready storage.
+Moxy replaces pop-and-pray delivery with leased delivery. A worker receives a
+temporary lease; if it ACKs, the task is completed. If it vanishes, the task is
+requeued after the lease expires.
+
+## Standard Redis Lists vs Moxy
+
+| Capability | Standard Redis List Consumer | Moxy |
+| --- | --- | --- |
+| Worker crash after fetch | Task can disappear | Task remains recoverable |
+| Visibility timeout | Build it yourself | Native lease expiration |
+| ACK semantics | Build it yourself | `MOXY.ACK lease_id` |
+| Expired task recovery | Manual scripts or side tables | Built into the engine |
+| Testable core logic | Usually buried in worker code | Dedicated core package |
+| Backend choices | Redis list only | MemoryQueue and RedisQueue |
+| Protocol status | Redis commands today | Protocol-neutral core today, proxy later |
+
+## 15-Second Recovery Demo
+
+Run the local recovery demo:
+
+```sh
+go run ./cmd/moxy-recovery-demo
+```
+
+It simulates a worker fetching a task, disappearing before ACK, and the reaper
+putting that task back into ready storage.
+
+To render a terminal GIF with [VHS](https://vhs.charm.sh/):
+
+```sh
+vhs demo/recovery.tape
+```
+
+The tape writes `docs/assets/recovery.gif`.
 
 ## What Works Today
 
@@ -58,18 +99,16 @@ flowchart LR
     Queue --> Redis
 ```
 
-`core.Engine` deliberately coordinates one queue. `service.Service` owns the map of
-queue names to engines. Queue backends own task storage; the core engine owns lease
-metadata and expiration scheduling.
+`core.Engine` coordinates one queue. `service.Service` owns the map of queue names
+to engines. Queue backends own task storage; the core engine owns lease metadata and
+expiration scheduling.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for more detail.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper system notes.
 
 ## Internal Commands
 
 The command layer is a Go API, not a network protocol. It exists so the eventual
 TCP/RESP layer can be thin.
-
-Supported commands:
 
 ```text
 MOXY.ENQUEUE queue payload
@@ -78,7 +117,7 @@ MOXY.ACK lease_id
 MOXY.STATS queue
 ```
 
-Example flow:
+Example:
 
 ```go
 svc := service.New(func(queueName string) queue.Backend {
@@ -87,17 +126,17 @@ svc := service.New(func(queueName string) queue.Backend {
 handler := command.NewHandler(svc)
 
 enqueue, _ := handler.Handle(command.Command{
-	Name: "MOXY.ENQUEUE",
+	Name: command.EnqueueName,
 	Args: []string{"emails", "send welcome email"},
 })
 
 fetch, _ := handler.Handle(command.Command{
-	Name: "MOXY.FETCH",
+	Name: command.FetchName,
 	Args: []string{"emails", "30000"},
 })
 
 _, _ = handler.Handle(command.Command{
-	Name: "MOXY.ACK",
+	Name: command.AckName,
 	Args: []string{fetch.LeaseID},
 })
 
@@ -132,9 +171,8 @@ backend := queue.NewRedisQueue(client, "emails")
 ```sh
 go test ./...
 go run ./cmd/moxy
+go run ./cmd/moxy-recovery-demo
 ```
-
-The demo runs a short command-layer scenario with `MemoryQueue`.
 
 ## Redis Integration Tests
 
@@ -172,14 +210,10 @@ go test ./internal/command -count=100
 Race testing is deferred until the local Windows development environment has
 cgo/GCC available.
 
-## License
-
-Moxy is released under the [MIT License](LICENSE).
-
 ## Non-Goals For This Phase
 
-Moxy is still single-node and backend-adapter based. The following are intentionally
-not implemented yet:
+Moxy is still single-node and backend-adapter based. These are intentionally not
+implemented yet:
 
 - TCP server
 - RESP parser
@@ -197,6 +231,10 @@ not implemented yet:
 - Add observability-friendly stats and structured errors.
 - Introduce TCP/RESP once the internal command model is stable.
 - Add persistence and crash recovery after the in-memory semantics remain boring.
+
+## License
+
+Moxy is released under the [MIT License](LICENSE).
 
 The boring part is the point: a queue reliability layer should be legible,
 testable, and conservative before it becomes networked.

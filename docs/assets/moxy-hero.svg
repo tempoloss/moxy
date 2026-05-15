@@ -1,0 +1,64 @@
+<svg width="1200" height="520" viewBox="0 0 1200 520" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Moxy leased queue reliability diagram</title>
+  <desc id="desc">Industrial diagram showing Redis-style ready tasks moving through Moxy leases into processing, with expired work recovered back to ready.</desc>
+  <defs>
+    <linearGradient id="panel" x1="80" y1="40" x2="1120" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0B1117"/>
+      <stop offset="1" stop-color="#121A24"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="118" y1="82" x2="1072" y2="430" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#21D4A8"/>
+      <stop offset="1" stop-color="#57A6FF"/>
+    </linearGradient>
+    <filter id="shadow" x="40" y="10" width="1120" height="500" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="520" fill="#05080C"/>
+  <g filter="url(#shadow)">
+    <rect x="70" y="50" width="1060" height="420" rx="22" fill="url(#panel)" stroke="#263445"/>
+  </g>
+
+  <path d="M119 118H1081" stroke="#223043" stroke-width="2"/>
+  <circle cx="145" cy="88" r="7" fill="#F05D5E"/>
+  <circle cx="170" cy="88" r="7" fill="#F4C95D"/>
+  <circle cx="195" cy="88" r="7" fill="#2DD4A3"/>
+  <text x="230" y="94" fill="#7D8DA1" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">moxy://leased-queue-runtime</text>
+
+  <text x="116" y="174" fill="#F6F8FB" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="58" font-weight="800" letter-spacing="0">Moxy</text>
+  <text x="116" y="217" fill="#9FB0C4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="24">Redis-style queues with leases, ACKs, and expiration recovery.</text>
+
+  <g transform="translate(116 278)">
+    <rect width="210" height="86" rx="12" fill="#101923" stroke="#304255"/>
+    <text x="24" y="34" fill="#9FB0C4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">READY</text>
+    <text x="24" y="63" fill="#F6F8FB" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">task payload</text>
+  </g>
+
+  <path d="M345 321H455" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M455 321L438 310V332L455 321Z" fill="#57A6FF"/>
+
+  <g transform="translate(474 252)">
+    <rect width="252" height="138" rx="16" fill="#0D151F" stroke="#2E4155"/>
+    <text x="24" y="38" fill="#21D4A8" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">LEASED</text>
+    <text x="24" y="72" fill="#F6F8FB" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="26" font-weight="800">visibility timeout</text>
+    <text x="24" y="106" fill="#9FB0C4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18">worker owns task temporarily</text>
+  </g>
+
+  <path d="M745 321H855" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M855 321L838 310V332L855 321Z" fill="#57A6FF"/>
+
+  <g transform="translate(874 278)">
+    <rect width="210" height="86" rx="12" fill="#101923" stroke="#304255"/>
+    <text x="24" y="34" fill="#9FB0C4" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">ACKED</text>
+    <text x="24" y="63" fill="#F6F8FB" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="22" font-weight="700">completed</text>
+  </g>
+
+  <path d="M600 405C600 446 305 446 305 365" stroke="#F59E0B" stroke-width="4" stroke-linecap="round" stroke-dasharray="10 10"/>
+  <path d="M305 365L294 382H316L305 365Z" fill="#F59E0B"/>
+  <text x="425" y="462" fill="#FBBF24" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" font-weight="700">expired lease requeues work automatically</text>
+
+  <rect x="788" y="146" width="296" height="82" rx="12" fill="#0D151F" stroke="#2E4155"/>
+  <text x="812" y="178" fill="#F6F8FB" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">at-least-once delivery</text>
+  <text x="812" y="205" fill="#9FB0C4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="17">No silent task disappearance.</text>
+</svg>
