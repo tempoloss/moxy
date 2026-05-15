@@ -21,8 +21,9 @@ READY -> PROCESSING -> EXPIRED -> REQUEUED -> READY
 ```
 
 Moxy is being built from the inside out: first the correctness model, then the
-network/protocol layer. The current repo is already useful as a compact Go
-reference for reliable queue internals.
+network/protocol layer, and only later transparent Redis proxying and persistence.
+The current repo is already useful as a compact Go reference for reliable queue
+internals.
 
 ## The Pain
 
@@ -48,7 +49,7 @@ requeued after the lease expires.
 | Expired task recovery | Manual scripts or side tables | Built into the engine |
 | Testable core logic | Usually buried in worker code | Dedicated core package |
 | Backend choices | Redis list only | MemoryQueue and RedisQueue |
-| Protocol status | Redis commands today | Protocol-neutral core today, proxy later |
+| Protocol status | Redis commands today | RESP command path for Moxy commands |
 
 ## 15-Second Recovery Demo
 
@@ -77,6 +78,8 @@ The tape writes `docs/assets/recovery.gif`.
 - Single-queue lease coordinator in `internal/core`.
 - Multi-queue service layer in `internal/service`.
 - Protocol-neutral command handler in `internal/command`.
+- RESP2 reader/writer in `internal/resp`.
+- Redis-compatible TCP command server for Moxy commands and `PING`.
 - Background expiration reaper.
 - Shared backend contract tests for MemoryQueue and RedisQueue.
 - Opt-in Redis integration tests.
@@ -85,6 +88,10 @@ The tape writes `docs/assets/recovery.gif`.
 
 ```mermaid
 flowchart LR
+    Client["RESP client<br/>redis-cli / Go client"]
+    Server["internal/server<br/>TCP accept loop"]
+    RESP["internal/resp<br/>RESP2 reader/writer"]
+    Protocol["internal/protocol<br/>RESP adapter"]
     Command["internal/command<br/>Protocol-neutral commands"]
     Service["internal/service<br/>Multiple named queues"]
     Core["internal/core<br/>Lease coordination"]
@@ -92,6 +99,10 @@ flowchart LR
     Memory["MemoryQueue"]
     Redis["RedisQueue"]
 
+    Client --> Server
+    Server --> RESP
+    Server --> Protocol
+    Protocol --> Command
     Command --> Service
     Service --> Core
     Core --> Queue
@@ -107,8 +118,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper system notes.
 
 ## Internal Commands
 
-The command layer is a Go API, not a network protocol. It exists so the eventual
-TCP/RESP layer can be thin.
+The command layer is protocol-neutral Go code. The TCP/RESP server translates
+wire input into these commands and translates command responses back to RESP.
 
 ```text
 MOXY.ENQUEUE queue payload
@@ -170,9 +181,40 @@ backend := queue.NewRedisQueue(client, "emails")
 
 ```sh
 go test ./...
-go run ./cmd/moxy
+go run ./cmd/moxy --addr 127.0.0.1:6380 --backend memory
 go run ./cmd/moxy-recovery-demo
 ```
+
+## Running Moxy TCP Server
+
+Memory backend:
+
+```sh
+go run ./cmd/moxy --addr 127.0.0.1:6380 --backend memory
+```
+
+Redis backend:
+
+```sh
+go run ./cmd/moxy --addr 127.0.0.1:6380 --backend redis --redis-addr localhost:6379
+```
+
+Testing with `redis-cli`:
+
+```sh
+redis-cli -p 6380 PING
+redis-cli -p 6380 MOXY.ENQUEUE jobs hello
+redis-cli -p 6380 MOXY.FETCH jobs 30000
+redis-cli -p 6380 MOXY.ACK <lease_id>
+redis-cli -p 6380 MOXY.STATS jobs
+```
+
+`MOXY.FETCH` returns a null bulk string when the named queue has no ready task.
+That makes an empty queue a normal condition instead of a server failure.
+
+This is not full Redis proxying yet. Only `PING` and `MOXY.*` commands are
+supported. Normal Redis commands such as `GET`, `SET`, and `INCR` are not passed
+through to Redis in this phase.
 
 ## Redis Integration Tests
 
@@ -205,6 +247,9 @@ go test ./internal/core -count=100
 go test ./internal/queue -count=100
 go test ./internal/service -count=100
 go test ./internal/command -count=100
+go test ./internal/resp -count=100
+go test ./internal/protocol -count=100
+go test ./internal/server -count=100
 ```
 
 Race testing is deferred until the local Windows development environment has
@@ -215,9 +260,8 @@ cgo/GCC available.
 Moxy is still single-node and backend-adapter based. These are intentionally not
 implemented yet:
 
-- TCP server
-- RESP parser
-- Redis proxying
+- Transparent Redis proxying
+- Full Redis command pass-through
 - WAL
 - snapshots
 - crash recovery
@@ -229,7 +273,7 @@ implemented yet:
 
 - Keep hardening the command/service boundary.
 - Add observability-friendly stats and structured errors.
-- Introduce TCP/RESP once the internal command model is stable.
+- Add transparent Redis pass-through after the Moxy command path stays boring.
 - Add persistence and crash recovery after the in-memory semantics remain boring.
 
 ## License
