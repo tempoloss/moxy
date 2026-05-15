@@ -4,12 +4,15 @@ import (
 	"context"
 	"log/slog"
 	"time"
-
-	"github.com/an8kk/moxy/internal/core"
 )
 
+// Target is any component that can reap expired leases.
+type Target interface {
+	ReapExpired(time.Time) (int, error)
+}
+
 // Run periodically reaps expired leases until the context is canceled.
-func Run(ctx context.Context, engine *core.Engine, interval time.Duration) {
+func Run(ctx context.Context, target Target, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -18,7 +21,7 @@ func Run(ctx context.Context, engine *core.Engine, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if _, err := engine.ReapExpired(now); err != nil {
+			if _, err := target.ReapExpired(now); err != nil {
 				slog.Error("reap expired leases", "err", err)
 			}
 		}

@@ -1,56 +1,73 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/an8kk/moxy/internal/command"
 	"github.com/an8kk/moxy/internal/queue"
+	"github.com/an8kk/moxy/internal/reaper"
+	"github.com/an8kk/moxy/internal/server"
 	"github.com/an8kk/moxy/internal/service"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
+	addr := flag.String("addr", "127.0.0.1:6380", "TCP address to listen on")
+	backend := flag.String("backend", "memory", "queue backend: memory or redis")
+	redisAddr := flag.String("redis-addr", "localhost:6379", "Redis address for the redis backend")
+	flag.Parse()
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	svc := service.New(func(queueName string) queue.Backend {
-		return queue.NewMemoryQueue()
-	})
+	factory, closeBackend := buildBackendFactory(ctx, logger, *backend, *redisAddr)
+	defer closeBackend()
+
+	svc := service.New(factory)
 	handler := command.NewHandler(svc)
+	srv := server.New(handler, server.Config{Addr: *addr})
 
-	enqueue, err := handler.Handle(command.Command{
-		Name: "MOXY.ENQUEUE",
-		Args: []string{"jobs", "send welcome email"},
-	})
-	exitOnError(logger, "enqueue task", err)
-	logger.Info("command result", "command", "MOXY.ENQUEUE", "task_id", enqueue.TaskID)
+	go reaper.Run(ctx, svc, time.Second)
 
-	fetch, err := handler.Handle(command.Command{
-		Name: "MOXY.FETCH",
-		Args: []string{"jobs", "1000"},
-	})
-	exitOnError(logger, "fetch task", err)
-	logger.Info("command result", "command", "MOXY.FETCH", "task_id", fetch.TaskID, "lease_id", fetch.LeaseID, "payload", string(fetch.Payload), "expires_at", fetch.ExpiresAt)
-
-	ack, err := handler.Handle(command.Command{
-		Name: "MOXY.ACK",
-		Args: []string{fetch.LeaseID},
-	})
-	exitOnError(logger, "ack task", err)
-	logger.Info("command result", "command", "MOXY.ACK", "ok", ack.OK)
-
-	stats, err := handler.Handle(command.Command{
-		Name: "MOXY.STATS",
-		Args: []string{"jobs"},
-	})
-	exitOnError(logger, "stats", err)
-	logger.Info("command result", "command", "MOXY.STATS", "stats", stats.Stats)
+	logger.Info("Moxy listening", "addr", *addr, "backend", *backend)
+	if err := srv.ListenAndServe(ctx); err != nil {
+		logger.Error("server stopped with error", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("Moxy stopped")
 }
 
-func exitOnError(logger *slog.Logger, message string, err error) {
-	if err == nil {
-		return
+func buildBackendFactory(ctx context.Context, logger *slog.Logger, backend, redisAddr string) (service.BackendFactory, func()) {
+	switch backend {
+	case "memory":
+		return func(queueName string) queue.Backend {
+			return queue.NewMemoryQueue()
+		}, func() {}
+	case "redis":
+		client := redis.NewClient(&redis.Options{Addr: redisAddr})
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := client.Ping(pingCtx).Err(); err != nil {
+			logger.Error("connect redis", "addr", redisAddr, "err", err)
+			os.Exit(1)
+		}
+		return func(queueName string) queue.Backend {
+				return queue.NewRedisQueue(client, queueName)
+			}, func() {
+				if err := client.Close(); err != nil {
+					logger.Error("close redis client", "err", err)
+				}
+			}
+	default:
+		logger.Error("unknown backend", "backend", backend)
+		os.Exit(1)
+		return nil, nil
 	}
-
-	logger.Error(message, "err", err)
-	os.Exit(1)
 }
