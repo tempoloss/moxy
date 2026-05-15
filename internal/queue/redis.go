@@ -17,6 +17,7 @@ type RedisQueue struct {
 	readyKey      string
 	processingKey string
 	deadKey       string
+	scripts       redisQueueScripts
 }
 
 func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
@@ -26,6 +27,7 @@ func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
 		readyKey:      keys.ready,
 		processingKey: keys.processing,
 		deadKey:       keys.dead,
+		scripts:       defaultRedisQueueScripts(),
 	}
 }
 
@@ -80,7 +82,7 @@ func (q *RedisQueue) Acquire() (task.Task, error) {
 
 // Complete atomically removes a processing task.
 func (q *RedisQueue) Complete(taskID string) error {
-	found, err := q.runTaskScript(completeTaskScript, taskID)
+	found, err := q.runTaskScript(q.scripts.complete, taskID)
 	if err != nil {
 		return err
 	}
@@ -93,7 +95,7 @@ func (q *RedisQueue) Complete(taskID string) error {
 
 // Requeue atomically moves a processing task back to ready storage.
 func (q *RedisQueue) Requeue(taskID string) error {
-	found, err := q.runTaskScript(requeueTaskScript, taskID)
+	found, err := q.runTaskScript(q.scripts.requeue, taskID)
 	if err != nil {
 		return err
 	}
@@ -161,41 +163,3 @@ func decodeTask(encoded string) (task.Task, error) {
 
 	return cloneTask(decoded), nil
 }
-
-var completeTaskScript = redis.NewScript(`
-local processing = KEYS[1]
-local needle = ARGV[1]
-local tasks = redis.call("LRANGE", processing, 0, -1)
-
-for _, encoded in ipairs(tasks) do
-	if string.find(encoded, needle, 1, true) then
-		local removed = redis.call("LREM", processing, 1, encoded)
-		if removed == 0 then
-			return 0
-		end
-		return 1
-	end
-end
-
-return 0
-`)
-
-var requeueTaskScript = redis.NewScript(`
-local processing = KEYS[1]
-local ready = KEYS[2]
-local needle = ARGV[1]
-local tasks = redis.call("LRANGE", processing, 0, -1)
-
-for _, encoded in ipairs(tasks) do
-	if string.find(encoded, needle, 1, true) then
-		local removed = redis.call("LREM", processing, 1, encoded)
-		if removed == 0 then
-			return 0
-		end
-		redis.call("LPUSH", ready, encoded)
-		return 1
-	end
-end
-
-return 0
-`)

@@ -123,6 +123,44 @@ func TestRedisQueueRepeatedRequeueFailsCleanly(t *testing.T) {
 	}
 }
 
+func TestRedisQueueCachedScriptsRunRepeatedly(t *testing.T) {
+	client := redisClientForTest(t)
+	queue := redisQueueForTest(t, client)
+
+	if queue.scripts.complete == nil {
+		t.Fatal("complete script is nil")
+	}
+	if queue.scripts.requeue == nil {
+		t.Fatal("requeue script is nil")
+	}
+
+	for _, id := range []string{"complete-1", "complete-2"} {
+		if err := queue.Enqueue(task.Task{ID: id}); err != nil {
+			t.Fatalf("enqueue %s returned error: %v", id, err)
+		}
+		acquired, err := queue.Acquire()
+		if err != nil {
+			t.Fatalf("acquire %s returned error: %v", id, err)
+		}
+		if err := queue.Complete(acquired.ID); err != nil {
+			t.Fatalf("complete %s returned error: %v", id, err)
+		}
+	}
+
+	for _, id := range []string{"requeue-1", "requeue-2"} {
+		if err := queue.Enqueue(task.Task{ID: id}); err != nil {
+			t.Fatalf("enqueue %s returned error: %v", id, err)
+		}
+		acquired, err := queue.Acquire()
+		if err != nil {
+			t.Fatalf("acquire %s returned error: %v", id, err)
+		}
+		if err := queue.Requeue(acquired.ID); err != nil {
+			t.Fatalf("requeue %s returned error: %v", id, err)
+		}
+	}
+}
+
 func redisClientForTest(t *testing.T) *redis.Client {
 	t.Helper()
 
