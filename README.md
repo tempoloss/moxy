@@ -20,10 +20,10 @@ READY -> PROCESSING -> ACKED
 READY -> PROCESSING -> EXPIRED -> REQUEUED -> READY
 ```
 
-Moxy is being built from the inside out: first the correctness model, then the
-network/protocol layer, and only later transparent Redis proxying and persistence.
-The current repo is already useful as a compact Go reference for reliable queue
-internals.
+Moxy is an early-stage alpha project being built from the inside out: first the
+correctness model, then the network/protocol layer, and only later transparent
+Redis proxying and persistence. The current repo is already useful as a compact
+Go reference for reliable queue internals.
 
 ## The Pain
 
@@ -255,7 +255,7 @@ go test ./internal/server -count=100
 Race testing is deferred until the local Windows development environment has
 cgo/GCC available.
 
-## Non-Goals For This Phase
+## Non-Goals For This Alpha
 
 Moxy is still single-node and backend-adapter based. These are intentionally not
 implemented yet:
