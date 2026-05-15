@@ -106,7 +106,8 @@ func cleanupRedisEngineQueue(t *testing.T, client *redis.Client, queueName strin
 	defer cancel()
 	readyKey := fmt.Sprintf("moxy:{%s}:ready", queueName)
 	processingKey := fmt.Sprintf("moxy:{%s}:processing", queueName)
-	if err := client.Del(ctx, readyKey, processingKey).Err(); err != nil {
+	deadKey := fmt.Sprintf("moxy:{%s}:dead", queueName)
+	if err := client.Del(ctx, readyKey, processingKey, deadKey).Err(); err != nil {
 		t.Fatalf("cleanup redis engine queue: %v", err)
 	}
 }

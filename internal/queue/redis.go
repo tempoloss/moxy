@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/an8kk/moxy/internal/task"
 	"github.com/redis/go-redis/v9"
@@ -15,14 +17,45 @@ type RedisQueue struct {
 	client        *redis.Client
 	readyKey      string
 	processingKey string
+	deadKey       string
+	scripts       redisQueueScripts
 }
 
 func NewRedisQueue(client *redis.Client, queueName string) *RedisQueue {
+	keys := newRedisQueueKeys(queueName)
 	return &RedisQueue{
 		client:        client,
-		readyKey:      fmt.Sprintf("moxy:{%s}:ready", queueName),
-		processingKey: fmt.Sprintf("moxy:{%s}:processing", queueName),
+		readyKey:      keys.ready,
+		processingKey: keys.processing,
+		deadKey:       keys.dead,
+		scripts:       defaultRedisQueueScripts(),
 	}
+}
+
+type redisQueueKeys struct {
+	ready      string
+	processing string
+	dead       string
+}
+
+func newRedisQueueKeys(queueName string) redisQueueKeys {
+	hashTag := fmt.Sprintf("{%s}", queueName)
+	prefix := "moxy:" + hashTag
+	return redisQueueKeys{
+		ready:      prefix + ":ready",
+		processing: prefix + ":processing",
+		dead:       prefix + ":dead",
+	}
+}
+
+func redisHashTag(key string) string {
+	start := strings.IndexByte(key, '{')
+	end := strings.IndexByte(key, '}')
+	if start < 0 || end <= start {
+		return ""
+	}
+
+	return key[start : end+1]
 }
 
 // Enqueue serializes a task and appends it to Redis ready storage.
@@ -50,7 +83,7 @@ func (q *RedisQueue) Acquire() (task.Task, error) {
 
 // Complete atomically removes a processing task.
 func (q *RedisQueue) Complete(taskID string) error {
-	found, err := q.runTaskScript(completeTaskScript, taskID)
+	found, err := q.runTaskScript(q.scripts.complete, taskID)
 	if err != nil {
 		return err
 	}
@@ -63,7 +96,7 @@ func (q *RedisQueue) Complete(taskID string) error {
 
 // Requeue atomically moves a processing task back to ready storage.
 func (q *RedisQueue) Requeue(taskID string) error {
-	found, err := q.runTaskScript(requeueTaskScript, taskID)
+	found, err := q.runTaskScript(q.scripts.requeue, taskID)
 	if err != nil {
 		return err
 	}
@@ -74,15 +107,42 @@ func (q *RedisQueue) Requeue(taskID string) error {
 	return nil
 }
 
-// Stats reports Redis ready and processing list lengths.
+// DeadLetter atomically moves a processing task to dead-letter storage.
+func (q *RedisQueue) DeadLetter(taskID string, reason string) error {
+	needle, err := taskIDNeedle(taskID)
+	if err != nil {
+		return err
+	}
+
+	result, err := q.scripts.dead.Run(
+		context.Background(),
+		q.client,
+		[]string{q.processingKey, q.deadKey},
+		needle,
+		reason,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	).Int()
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return ErrTaskNotProcessing
+	}
+
+	return nil
+}
+
+// Stats reports Redis ready, processing, and dead list lengths.
 func (q *RedisQueue) Stats() Stats {
 	ctx := context.Background()
 	ready := q.client.LLen(ctx, q.readyKey).Val()
 	processing := q.client.LLen(ctx, q.processingKey).Val()
+	dead := q.client.LLen(ctx, q.deadKey).Val()
 
 	return Stats{
 		Ready:      int(ready),
 		Processing: int(processing),
+		Dead:       int(dead),
 	}
 }
 
@@ -111,7 +171,7 @@ func taskIDNeedle(taskID string) (string, error) {
 		return "", err
 	}
 
-	return `"ID":` + string(encoded), nil
+	return `"id":` + string(encoded), nil
 }
 
 func encodeTask(item task.Task) (string, error) {
@@ -132,40 +192,12 @@ func decodeTask(encoded string) (task.Task, error) {
 	return cloneTask(decoded), nil
 }
 
-var completeTaskScript = redis.NewScript(`
-local processing = KEYS[1]
-local needle = ARGV[1]
-local tasks = redis.call("LRANGE", processing, 0, -1)
+func decodeDeadTask(encoded string) (DeadTask, error) {
+	var decoded DeadTask
+	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+		return DeadTask{}, err
+	}
 
-for _, encoded in ipairs(tasks) do
-	if string.find(encoded, needle, 1, true) then
-		local removed = redis.call("LREM", processing, 1, encoded)
-		if removed == 0 then
-			return 0
-		end
-		return 1
-	end
-end
-
-return 0
-`)
-
-var requeueTaskScript = redis.NewScript(`
-local processing = KEYS[1]
-local ready = KEYS[2]
-local needle = ARGV[1]
-local tasks = redis.call("LRANGE", processing, 0, -1)
-
-for _, encoded in ipairs(tasks) do
-	if string.find(encoded, needle, 1, true) then
-		local removed = redis.call("LREM", processing, 1, encoded)
-		if removed == 0 then
-			return 0
-		end
-		redis.call("LPUSH", ready, encoded)
-		return 1
-	end
-end
-
-return 0
-`)
+	decoded.Task = cloneTask(decoded.Task)
+	return decoded, nil
+}

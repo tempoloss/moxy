@@ -129,6 +129,35 @@ func TestReapExpiredRequeuesExpiredLeasesAcrossAllQueues(t *testing.T) {
 	}
 }
 
+func TestServiceConfigMaxAttemptsDeadLettersExpiredTasks(t *testing.T) {
+	service := NewWithConfig(memoryBackendFactory, ServiceConfig{
+		Engine: core.EngineConfig{MaxAttempts: 1},
+	})
+	if _, err := service.Enqueue("jobs", []byte("payload")); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	lease, err := service.Fetch("jobs", time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch returned error: %v", err)
+	}
+
+	requeued, err := service.ReapExpired(lease.ExpiresAt.Add(time.Nanosecond))
+	if err != nil {
+		t.Fatalf("reap expired returned error: %v", err)
+	}
+	if requeued != 1 {
+		t.Fatalf("reap count = %d, want 1", requeued)
+	}
+
+	stats, ok := service.Stats("jobs")
+	if !ok {
+		t.Fatal("stats did not report queue")
+	}
+	if stats.Ready != 0 || stats.Processing != 0 || stats.ActiveLeases != 0 || stats.Dead != 1 {
+		t.Fatalf("stats = %+v, want ready=0 processing=0 active=0 dead=1", stats)
+	}
+}
+
 func TestEmptyQueueNameFails(t *testing.T) {
 	service := New(memoryBackendFactory)
 
@@ -178,8 +207,8 @@ func TestStatsReportsPerQueueState(t *testing.T) {
 	if !ok {
 		t.Fatal("stats did not report queue")
 	}
-	if stats.Ready != 1 || stats.Processing != 1 || stats.ActiveLeases != 1 || stats.ExpirationHeap != 1 {
-		t.Fatalf("stats = %+v, want ready=1 processing=1 active=1 heap=1", stats)
+	if stats.Ready != 1 || stats.Processing != 1 || stats.ActiveLeases != 1 || stats.ExpirationHeap != 1 || stats.Dead != 0 {
+		t.Fatalf("stats = %+v, want ready=1 processing=1 active=1 heap=1 dead=0", stats)
 	}
 }
 

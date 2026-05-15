@@ -22,8 +22,15 @@ const requeueRetryDelay = time.Second
 type Stats struct {
 	Ready          int
 	Processing     int
+	Dead           int
 	ActiveLeases   int
 	ExpirationHeap int
+}
+
+// EngineConfig controls lease expiration behavior.
+type EngineConfig struct {
+	MaxAttempts       int
+	RequeueRetryDelay time.Duration
 }
 
 // Engine owns all mutable in-memory queue, lease, and expiration state.
@@ -32,6 +39,7 @@ type Engine struct {
 	ready       queue.Backend
 	leases      map[string]*Lease
 	expirations expirationHeap
+	config      EngineConfig
 }
 
 // NewEngine creates an empty in-memory lease engine.
@@ -41,17 +49,31 @@ func NewEngine() *Engine {
 
 // NewEngineWithBackend creates a single-queue lease engine over the provided backend.
 func NewEngineWithBackend(backend queue.Backend) *Engine {
-	return newEngine(backend)
+	return newEngine(backend, EngineConfig{})
 }
 
-func newEngine(backend queue.Backend) *Engine {
+// NewEngineWithBackendAndConfig creates a lease engine with explicit expiration config.
+func NewEngineWithBackendAndConfig(backend queue.Backend, config EngineConfig) *Engine {
+	return newEngine(backend, config)
+}
+
+func newEngine(backend queue.Backend, configs ...EngineConfig) *Engine {
+	var config EngineConfig
+	if len(configs) > 0 {
+		config = configs[0]
+	}
+
 	expirations := expirationHeap{}
 	heap.Init(&expirations)
+	if config.RequeueRetryDelay <= 0 {
+		config.RequeueRetryDelay = requeueRetryDelay
+	}
 
 	return &Engine{
 		ready:       backend,
 		leases:      make(map[string]*Lease),
 		expirations: expirations,
+		config:      config,
 	}
 }
 
@@ -141,10 +163,11 @@ func (e *Engine) ReapExpired(now time.Time) (int, error) {
 			continue
 		}
 
-		if err := e.ready.Requeue(lease.Task.ID); err != nil {
+		err := e.expireLease(lease)
+		if err != nil {
 			heap.Push(&e.expirations, expirationItem{
 				LeaseID:   item.LeaseID,
-				ExpiresAt: now.Add(requeueRetryDelay),
+				ExpiresAt: now.Add(e.config.RequeueRetryDelay),
 			})
 			return requeued, err
 		}
@@ -153,6 +176,18 @@ func (e *Engine) ReapExpired(now time.Time) (int, error) {
 	}
 
 	return requeued, nil
+}
+
+func (e *Engine) expireLease(lease *Lease) error {
+	if e.shouldDeadLetter(lease) {
+		return e.ready.DeadLetter(lease.Task.ID, "max attempts exceeded")
+	}
+
+	return e.ready.Requeue(lease.Task.ID)
+}
+
+func (e *Engine) shouldDeadLetter(lease *Lease) bool {
+	return e.config.MaxAttempts > 0 && lease.Task.Attempts+1 >= e.config.MaxAttempts
 }
 
 // Stats returns counts for tests and diagnostics.
@@ -164,6 +199,7 @@ func (e *Engine) Stats() Stats {
 	return Stats{
 		Ready:          queueStats.Ready,
 		Processing:     queueStats.Processing,
+		Dead:           queueStats.Dead,
 		ActiveLeases:   len(e.leases),
 		ExpirationHeap: e.expirations.Len(),
 	}
@@ -184,8 +220,9 @@ func cloneLease(lease *Lease) *Lease {
 
 func cloneTask(task Task) Task {
 	return Task{
-		ID:      task.ID,
-		Payload: cloneBytes(task.Payload),
+		ID:       task.ID,
+		Payload:  cloneBytes(task.Payload),
+		Attempts: task.Attempts,
 	}
 }
 

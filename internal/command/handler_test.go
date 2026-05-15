@@ -3,6 +3,7 @@ package command
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/an8kk/moxy/internal/core"
 	"github.com/an8kk/moxy/internal/queue"
@@ -137,6 +138,37 @@ func TestStatsReportsQueueState(t *testing.T) {
 	}
 	if stats.Stats.Ready != 1 || stats.Stats.Processing != 1 || stats.Stats.ActiveLeases != 1 {
 		t.Fatalf("stats = %+v, want ready=1 processing=1 active=1", stats.Stats)
+	}
+	if stats.Stats.Dead != 0 {
+		t.Fatalf("dead count = %d, want 0", stats.Stats.Dead)
+	}
+}
+
+func TestStatsReportsDeadCount(t *testing.T) {
+	svc := service.NewWithConfig(func(queueName string) queue.Backend {
+		return queue.NewMemoryQueue()
+	}, service.ServiceConfig{
+		Engine: core.EngineConfig{MaxAttempts: 1},
+	})
+	handler := NewHandler(svc)
+
+	if _, err := handler.Handle(Command{Name: "MOXY.ENQUEUE", Args: []string{"jobs", "payload"}}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	fetch, err := handler.Handle(Command{Name: "MOXY.FETCH", Args: []string{"jobs", "1"}})
+	if err != nil {
+		t.Fatalf("fetch returned error: %v", err)
+	}
+	if _, err := svc.ReapExpired(fetch.ExpiresAt.Add(time.Nanosecond)); err != nil {
+		t.Fatalf("reap expired returned error: %v", err)
+	}
+
+	stats, err := handler.Handle(Command{Name: "MOXY.STATS", Args: []string{"jobs"}})
+	if err != nil {
+		t.Fatalf("stats returned error: %v", err)
+	}
+	if stats.Stats.Dead != 1 {
+		t.Fatalf("dead count = %d, want 1", stats.Stats.Dead)
 	}
 }
 

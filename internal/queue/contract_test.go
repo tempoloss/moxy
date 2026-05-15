@@ -31,8 +31,17 @@ func RunBackendContractTests(t *testing.T, factory backendFactory) {
 	t.Run("RequeueMovesProcessingTaskBackToReady", func(t *testing.T) {
 		testRequeueMovesProcessingTaskBackToReady(t, factory)
 	})
+	t.Run("RequeueIncrementsAttempts", func(t *testing.T) {
+		testRequeueIncrementsAttempts(t, factory)
+	})
 	t.Run("RequeueMissingProcessingTaskFails", func(t *testing.T) {
 		testRequeueMissingProcessingTaskFails(t, factory)
+	})
+	t.Run("DeadLetterMovesProcessingTaskToDead", func(t *testing.T) {
+		testDeadLetterMovesProcessingTaskToDead(t, factory)
+	})
+	t.Run("DeadLetterMissingProcessingTaskFails", func(t *testing.T) {
+		testDeadLetterMissingProcessingTaskFails(t, factory)
 	})
 	t.Run("StatsReportsReadyAndProcessing", func(t *testing.T) {
 		testStatsReportsReadyAndProcessing(t, factory)
@@ -172,11 +181,61 @@ func testRequeueMissingProcessingTaskFails(t *testing.T, factory backendFactory)
 	}
 }
 
+func testRequeueIncrementsAttempts(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "task-1", Attempts: 2}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := backend.Requeue(acquired.ID); err != nil {
+		t.Fatalf("requeue returned error: %v", err)
+	}
+	again, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire after requeue returned error: %v", err)
+	}
+	if again.Attempts != 3 {
+		t.Fatalf("attempts after requeue = %d, want 3", again.Attempts)
+	}
+}
+
+func testDeadLetterMovesProcessingTaskToDead(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "task-1", Attempts: 1}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := backend.DeadLetter(acquired.ID, "expired"); err != nil {
+		t.Fatalf("dead letter returned error: %v", err)
+	}
+
+	stats := backend.Stats()
+	if stats.Ready != 0 || stats.Processing != 0 || stats.Dead != 1 {
+		t.Fatalf("stats after dead letter = %+v, want ready=0 processing=0 dead=1", stats)
+	}
+}
+
+func testDeadLetterMissingProcessingTaskFails(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+
+	if err := backend.DeadLetter("missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+		t.Fatalf("dead letter returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
 func testStatsReportsReadyAndProcessing(t *testing.T, factory backendFactory) {
 	backend := factory(t)
 
-	if got := backend.Stats(); got.Ready != 0 || got.Processing != 0 {
-		t.Fatalf("initial stats = %+v, want ready=0 processing=0", got)
+	if got := backend.Stats(); got.Ready != 0 || got.Processing != 0 || got.Dead != 0 {
+		t.Fatalf("initial stats = %+v, want ready=0 processing=0 dead=0", got)
 	}
 	if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue first returned error: %v", err)
@@ -184,22 +243,22 @@ func testStatsReportsReadyAndProcessing(t *testing.T, factory backendFactory) {
 	if err := backend.Enqueue(task.Task{ID: "task-2"}); err != nil {
 		t.Fatalf("enqueue second returned error: %v", err)
 	}
-	if got := backend.Stats(); got.Ready != 2 || got.Processing != 0 {
-		t.Fatalf("stats after enqueue = %+v, want ready=2 processing=0", got)
+	if got := backend.Stats(); got.Ready != 2 || got.Processing != 0 || got.Dead != 0 {
+		t.Fatalf("stats after enqueue = %+v, want ready=2 processing=0 dead=0", got)
 	}
 
 	acquired, err := backend.Acquire()
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
-	if got := backend.Stats(); got.Ready != 1 || got.Processing != 1 {
-		t.Fatalf("stats after acquire = %+v, want ready=1 processing=1", got)
+	if got := backend.Stats(); got.Ready != 1 || got.Processing != 1 || got.Dead != 0 {
+		t.Fatalf("stats after acquire = %+v, want ready=1 processing=1 dead=0", got)
 	}
 	if err := backend.Complete(acquired.ID); err != nil {
 		t.Fatalf("complete returned error: %v", err)
 	}
-	if got := backend.Stats(); got.Ready != 1 || got.Processing != 0 {
-		t.Fatalf("stats after complete = %+v, want ready=1 processing=0", got)
+	if got := backend.Stats(); got.Ready != 1 || got.Processing != 0 || got.Dead != 0 {
+		t.Fatalf("stats after complete = %+v, want ready=1 processing=0 dead=0", got)
 	}
 }
 

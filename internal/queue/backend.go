@@ -2,6 +2,7 @@ package queue
 
 import (
 	"errors"
+	"time"
 
 	"github.com/an8kk/moxy/internal/task"
 )
@@ -15,6 +16,14 @@ var (
 type Stats struct {
 	Ready      int
 	Processing int
+	Dead       int
+}
+
+// DeadTask records a task that has left the retry loop.
+type DeadTask struct {
+	Task   task.Task `json:"task"`
+	Reason string    `json:"reason"`
+	DeadAt time.Time `json:"dead_at"`
 }
 
 // Backend is the minimal ready-queue storage boundary used by the core engine.
@@ -23,5 +32,6 @@ type Backend interface {
 	Acquire() (task.Task, error)
 	Complete(taskID string) error
 	Requeue(taskID string) error
+	DeadLetter(taskID string, reason string) error
 	Stats() Stats
 }

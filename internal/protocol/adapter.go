@@ -88,6 +88,8 @@ func responseToRESP(name string, response command.Response) resp.Value {
 			resp.Integer(int64(response.Stats.Ready)),
 			resp.BulkString("processing"),
 			resp.Integer(int64(response.Stats.Processing)),
+			resp.BulkString("dead"),
+			resp.Integer(int64(response.Stats.Dead)),
 			resp.BulkString("active_leases"),
 			resp.Integer(int64(response.Stats.ActiveLeases)),
 			resp.BulkString("heap"),
