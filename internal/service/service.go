@@ -19,18 +19,30 @@ type BackendFactory func(queueName string) queue.Backend
 // Stats reports the state of one service-managed queue.
 type Stats = core.Stats
 
+// ServiceConfig controls engines created by the service.
+type ServiceConfig struct {
+	Engine core.EngineConfig
+}
+
 // Service owns multiple named queues.
 type Service struct {
 	mu      sync.Mutex
 	factory BackendFactory
 	engines map[string]*core.Engine
+	config  ServiceConfig
 }
 
 // New creates a service that lazily creates engines from the backend factory.
 func New(factory BackendFactory) *Service {
+	return NewWithConfig(factory, ServiceConfig{})
+}
+
+// NewWithConfig creates a service that applies config to lazily created engines.
+func NewWithConfig(factory BackendFactory, config ServiceConfig) *Service {
 	return &Service{
 		factory: factory,
 		engines: make(map[string]*core.Engine),
+		config:  config,
 	}
 }
 
@@ -115,7 +127,7 @@ func (s *Service) engineFor(queueName string) (*core.Engine, error) {
 		return engine, nil
 	}
 
-	engine = core.NewEngineWithBackend(s.factory(queueName))
+	engine = core.NewEngineWithBackendAndConfig(s.factory(queueName), s.config.Engine)
 	s.engines[queueName] = engine
 	return engine, nil
 }

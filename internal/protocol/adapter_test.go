@@ -78,15 +78,17 @@ func TestRESPMoxyStatsReturnsQueueState(t *testing.T) {
 
 	reply := adapter.Handle(resp.Array(resp.BulkString("MOXY.STATS"), resp.BulkString("jobs")))
 
-	assertArrayLength(t, reply, 8)
+	assertArrayLength(t, reply, 10)
 	assertBulkString(t, reply.Array[0], "ready")
 	assertInteger(t, reply.Array[1], 1)
 	assertBulkString(t, reply.Array[2], "processing")
 	assertInteger(t, reply.Array[3], 1)
-	assertBulkString(t, reply.Array[4], "active_leases")
-	assertInteger(t, reply.Array[5], 1)
-	assertBulkString(t, reply.Array[6], "heap")
+	assertBulkString(t, reply.Array[4], "dead")
+	assertInteger(t, reply.Array[5], 0)
+	assertBulkString(t, reply.Array[6], "active_leases")
 	assertInteger(t, reply.Array[7], 1)
+	assertBulkString(t, reply.Array[8], "heap")
+	assertInteger(t, reply.Array[9], 1)
 }
 
 func TestRESPInvalidCommandReturnsError(t *testing.T) {

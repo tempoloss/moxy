@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/an8kk/moxy/internal/task"
 	"github.com/redis/go-redis/v9"
@@ -106,15 +107,42 @@ func (q *RedisQueue) Requeue(taskID string) error {
 	return nil
 }
 
-// Stats reports Redis ready and processing list lengths.
+// DeadLetter atomically moves a processing task to dead-letter storage.
+func (q *RedisQueue) DeadLetter(taskID string, reason string) error {
+	needle, err := taskIDNeedle(taskID)
+	if err != nil {
+		return err
+	}
+
+	result, err := q.scripts.dead.Run(
+		context.Background(),
+		q.client,
+		[]string{q.processingKey, q.deadKey},
+		needle,
+		reason,
+		time.Now().UTC().Format(time.RFC3339Nano),
+	).Int()
+	if err != nil {
+		return err
+	}
+	if result == 0 {
+		return ErrTaskNotProcessing
+	}
+
+	return nil
+}
+
+// Stats reports Redis ready, processing, and dead list lengths.
 func (q *RedisQueue) Stats() Stats {
 	ctx := context.Background()
 	ready := q.client.LLen(ctx, q.readyKey).Val()
 	processing := q.client.LLen(ctx, q.processingKey).Val()
+	dead := q.client.LLen(ctx, q.deadKey).Val()
 
 	return Stats{
 		Ready:      int(ready),
 		Processing: int(processing),
+		Dead:       int(dead),
 	}
 }
 
@@ -143,7 +171,7 @@ func taskIDNeedle(taskID string) (string, error) {
 		return "", err
 	}
 
-	return `"ID":` + string(encoded), nil
+	return `"id":` + string(encoded), nil
 }
 
 func encodeTask(item task.Task) (string, error) {
@@ -162,4 +190,14 @@ func decodeTask(encoded string) (task.Task, error) {
 	}
 
 	return cloneTask(decoded), nil
+}
+
+func decodeDeadTask(encoded string) (DeadTask, error) {
+	var decoded DeadTask
+	if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+		return DeadTask{}, err
+	}
+
+	decoded.Task = cloneTask(decoded.Task)
+	return decoded, nil
 }

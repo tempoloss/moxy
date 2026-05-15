@@ -123,6 +123,64 @@ func TestRedisQueueRepeatedRequeueFailsCleanly(t *testing.T) {
 	}
 }
 
+func TestRedisQueueDeadLetterMovesTaskToDeadKey(t *testing.T) {
+	client := redisClientForTest(t)
+	queue := redisQueueForTest(t, client)
+
+	if err := queue.Enqueue(task.Task{ID: "task-1", Payload: []byte("payload")}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := queue.Acquire()
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+		t.Fatalf("dead letter returned error: %v", err)
+	}
+
+	stats := queue.Stats()
+	if stats.Ready != 0 || stats.Processing != 0 || stats.Dead != 1 {
+		t.Fatalf("stats after dead letter = %+v, want ready=0 processing=0 dead=1", stats)
+	}
+	dead := redisDeadTasks(t, client, queue)
+	if len(dead) != 1 {
+		t.Fatalf("dead task count = %d, want 1", len(dead))
+	}
+	if dead[0].Task.ID != "task-1" || dead[0].Task.Attempts != 1 || dead[0].Reason != "expired" {
+		t.Fatalf("dead entry = %+v, want task-1 attempts=1 reason=expired", dead[0])
+	}
+}
+
+func TestRedisQueueDeadLetterMissingTaskReturnsErrTaskNotProcessing(t *testing.T) {
+	client := redisClientForTest(t)
+	queue := redisQueueForTest(t, client)
+
+	if err := queue.DeadLetter("missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+		t.Fatalf("dead letter returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
+func TestRedisQueueRepeatedDeadLetterFailsCleanly(t *testing.T) {
+	client := redisClientForTest(t)
+	queue := redisQueueForTest(t, client)
+
+	if err := queue.Enqueue(task.Task{ID: "task-1"}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := queue.Acquire()
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+		t.Fatalf("first dead letter returned error: %v", err)
+	}
+	if err := queue.DeadLetter(acquired.ID, "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+		t.Fatalf("second dead letter returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
 func TestRedisQueueCachedScriptsRunRepeatedly(t *testing.T) {
 	client := redisClientForTest(t)
 	queue := redisQueueForTest(t, client)
@@ -159,6 +217,27 @@ func TestRedisQueueCachedScriptsRunRepeatedly(t *testing.T) {
 			t.Fatalf("requeue %s returned error: %v", id, err)
 		}
 	}
+}
+
+func redisDeadTasks(t *testing.T, client *redis.Client, queue *RedisQueue) []DeadTask {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	encoded, err := client.LRange(ctx, queue.deadKey, 0, -1).Result()
+	if err != nil {
+		t.Fatalf("read dead key: %v", err)
+	}
+
+	dead := make([]DeadTask, 0, len(encoded))
+	for _, item := range encoded {
+		decoded, err := decodeDeadTask(item)
+		if err != nil {
+			t.Fatalf("decode dead task %q: %v", item, err)
+		}
+		dead = append(dead, decoded)
+	}
+	return dead
 }
 
 func redisClientForTest(t *testing.T) *redis.Client {

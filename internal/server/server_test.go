@@ -95,11 +95,14 @@ func TestServerMoxyStatsReturnsStats(t *testing.T) {
 
 	sendRESP(t, conn, resp.Array(resp.BulkString("MOXY.ENQUEUE"), resp.BulkString("jobs"), resp.BulkString("hello")))
 	stats := sendRESP(t, conn, resp.Array(resp.BulkString("MOXY.STATS"), resp.BulkString("jobs")))
-	if stats.Type != resp.TypeArray || len(stats.Array) != 8 {
-		t.Fatalf("stats reply = %+v, want 8-element array", stats)
+	if stats.Type != resp.TypeArray || len(stats.Array) != 10 {
+		t.Fatalf("stats reply = %+v, want 10-element array", stats)
 	}
 	if stats.Array[0].String != "ready" || stats.Array[1].Integer != 1 {
 		t.Fatalf("stats reply = %+v, want ready=1", stats)
+	}
+	if stats.Array[4].String != "dead" || stats.Array[5].Integer != 0 {
+		t.Fatalf("stats reply = %+v, want dead=0", stats)
 	}
 }
 

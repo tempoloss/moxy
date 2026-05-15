@@ -2,6 +2,7 @@ package queue
 
 import (
 	"sync"
+	"time"
 
 	"github.com/an8kk/moxy/internal/task"
 )
@@ -11,6 +12,7 @@ type MemoryQueue struct {
 	mu         sync.Mutex
 	ready      []task.Task
 	processing map[string]task.Task
+	dead       []DeadTask
 }
 
 // NewMemoryQueue creates an empty in-memory queue backend.
@@ -18,6 +20,7 @@ func NewMemoryQueue() *MemoryQueue {
 	return &MemoryQueue{
 		ready:      make([]task.Task, 0),
 		processing: make(map[string]task.Task),
+		dead:       make([]DeadTask, 0),
 	}
 }
 
@@ -73,11 +76,32 @@ func (q *MemoryQueue) Requeue(taskID string) error {
 	}
 
 	delete(q.processing, taskID)
+	task.Attempts++
 	q.ready = append(q.ready, cloneTask(task))
 	return nil
 }
 
-// Stats reports ready and processing task counts.
+// DeadLetter moves a processing task into dead-letter storage.
+func (q *MemoryQueue) DeadLetter(taskID string, reason string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	task, ok := q.processing[taskID]
+	if !ok {
+		return ErrTaskNotProcessing
+	}
+
+	delete(q.processing, taskID)
+	task.Attempts++
+	q.dead = append(q.dead, DeadTask{
+		Task:   cloneTask(task),
+		Reason: reason,
+		DeadAt: time.Now().UTC(),
+	})
+	return nil
+}
+
+// Stats reports ready, processing, and dead task counts.
 func (q *MemoryQueue) Stats() Stats {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -85,13 +109,15 @@ func (q *MemoryQueue) Stats() Stats {
 	return Stats{
 		Ready:      len(q.ready),
 		Processing: len(q.processing),
+		Dead:       len(q.dead),
 	}
 }
 
 func cloneTask(item task.Task) task.Task {
 	return task.Task{
-		ID:      item.ID,
-		Payload: cloneBytes(item.Payload),
+		ID:       item.ID,
+		Payload:  cloneBytes(item.Payload),
+		Attempts: item.Attempts,
 	}
 }
 
