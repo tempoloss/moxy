@@ -7,6 +7,7 @@ import (
 
 	"github.com/an8kk/moxy/internal/core"
 	"github.com/an8kk/moxy/internal/queue"
+	"github.com/an8kk/moxy/internal/task"
 )
 
 func TestEnqueueCreatesQueueLazily(t *testing.T) {
@@ -142,6 +143,25 @@ func TestEmptyQueueNameFails(t *testing.T) {
 	}
 }
 
+func TestEnqueueReturnsBackendError(t *testing.T) {
+	service := New(func(queueName string) queue.Backend {
+		return &failingEnqueueBackend{Backend: queue.NewMemoryQueue()}
+	})
+
+	created, err := service.Enqueue("jobs", []byte("payload"))
+	if !errors.Is(err, errEnqueueFailed) {
+		t.Fatalf("enqueue returned task %+v and error %v, want errEnqueueFailed", created, err)
+	}
+
+	stats, ok := service.Stats("jobs")
+	if !ok {
+		t.Fatal("stats did not report lazily created queue")
+	}
+	if stats.Ready != 0 {
+		t.Fatalf("ready count = %d, want 0", stats.Ready)
+	}
+}
+
 func TestStatsReportsPerQueueState(t *testing.T) {
 	service := New(memoryBackendFactory)
 	if _, err := service.Enqueue("jobs", []byte("one")); err != nil {
@@ -165,6 +185,16 @@ func TestStatsReportsPerQueueState(t *testing.T) {
 
 func memoryBackendFactory(queueName string) queue.Backend {
 	return queue.NewMemoryQueue()
+}
+
+var errEnqueueFailed = errors.New("enqueue failed")
+
+type failingEnqueueBackend struct {
+	queue.Backend
+}
+
+func (b *failingEnqueueBackend) Enqueue(task.Task) error {
+	return errEnqueueFailed
 }
 
 func maxTime(a, b time.Time) time.Time {

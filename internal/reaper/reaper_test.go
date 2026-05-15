@@ -28,7 +28,9 @@ func TestRunStarts(t *testing.T) {
 
 func TestRunEventuallyRequeuesExpiredLeases(t *testing.T) {
 	engine := core.NewEngine()
-	engine.Enqueue([]byte("first"))
+	if _, err := engine.Enqueue([]byte("first")); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
 	if _, err := engine.Fetch(time.Millisecond); err != nil {
 		t.Fatalf("fetch returned error: %v", err)
 	}

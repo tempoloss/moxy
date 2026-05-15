@@ -41,7 +41,10 @@ func TestRedisQueueEngineIntegration(t *testing.T) {
 	})
 
 	engine := newEngine(backend)
-	task := engine.Enqueue([]byte("payload"))
+	task, err := engine.Enqueue([]byte("payload"))
+	if err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
 	lease, err := engine.Fetch(time.Minute)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -62,7 +65,10 @@ func TestRedisQueueEngineIntegration(t *testing.T) {
 		t.Fatalf("stats after ack = %+v, want ready=0 processing=0 active=0", stats)
 	}
 
-	expiring := engine.Enqueue([]byte("expire-me"))
+	expiring, err := engine.Enqueue([]byte("expire-me"))
+	if err != nil {
+		t.Fatalf("enqueue expiring task returned error: %v", err)
+	}
 	expiringLease, err := engine.Fetch(time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch expiring task returned error: %v", err)

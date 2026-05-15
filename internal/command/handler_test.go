@@ -7,6 +7,7 @@ import (
 	"github.com/an8kk/moxy/internal/core"
 	"github.com/an8kk/moxy/internal/queue"
 	"github.com/an8kk/moxy/internal/service"
+	"github.com/an8kk/moxy/internal/task"
 )
 
 func TestEnqueueThenFetchReturnsSamePayload(t *testing.T) {
@@ -108,6 +109,16 @@ func TestInvalidTimeoutFails(t *testing.T) {
 	}
 }
 
+func TestEnqueueReturnsBackendError(t *testing.T) {
+	handler := NewHandler(service.New(func(queueName string) queue.Backend {
+		return &failingEnqueueBackend{Backend: queue.NewMemoryQueue()}
+	}))
+
+	if _, err := handler.Handle(Command{Name: "MOXY.ENQUEUE", Args: []string{"jobs", "payload"}}); !errors.Is(err, errEnqueueFailed) {
+		t.Fatalf("enqueue error = %v, want errEnqueueFailed", err)
+	}
+}
+
 func TestStatsReportsQueueState(t *testing.T) {
 	handler := newTestHandler()
 	if _, err := handler.Handle(Command{Name: "MOXY.ENQUEUE", Args: []string{"jobs", "one"}}); err != nil {
@@ -133,4 +144,14 @@ func newTestHandler() *Handler {
 	return NewHandler(service.New(func(queueName string) queue.Backend {
 		return queue.NewMemoryQueue()
 	}))
+}
+
+var errEnqueueFailed = errors.New("enqueue failed")
+
+type failingEnqueueBackend struct {
+	queue.Backend
+}
+
+func (b *failingEnqueueBackend) Enqueue(task.Task) error {
+	return errEnqueueFailed
 }

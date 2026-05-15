@@ -11,7 +11,7 @@ import (
 func TestFetchCreatesLease(t *testing.T) {
 	engine := NewEngine()
 
-	task := engine.Enqueue([]byte("first"))
+	task := enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(time.Minute)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -47,7 +47,7 @@ func TestFetchCreatesLease(t *testing.T) {
 
 func TestAckRemovesLease(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(10 * time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -80,7 +80,7 @@ func TestAckRemovesLease(t *testing.T) {
 
 func TestFetchInvalidTimeoutFails(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 
 	if lease, err := engine.Fetch(0); !errors.Is(err, ErrInvalidTimeout) {
 		t.Fatalf("Fetch(0) returned lease %+v and error %v, want ErrInvalidTimeout", lease, err)
@@ -108,7 +108,7 @@ func TestEnqueueCopiesPayload(t *testing.T) {
 	engine := NewEngine()
 	payload := []byte("payload")
 
-	task := engine.Enqueue(payload)
+	task := enqueue(t, engine, payload)
 	payload[0] = 'P'
 	task.Payload[1] = 'A'
 
@@ -123,7 +123,7 @@ func TestEnqueueCopiesPayload(t *testing.T) {
 
 func TestReturnedLeasePayloadDoesNotMutateEngine(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("payload"))
+	enqueue(t, engine, []byte("payload"))
 
 	lease, err := engine.Fetch(time.Millisecond)
 	if err != nil {
@@ -150,7 +150,7 @@ func TestReturnedLeasePayloadDoesNotMutateEngine(t *testing.T) {
 
 func TestAckedLeaseHeapEntryIsIgnored(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -184,7 +184,7 @@ func TestAckedLeaseHeapEntryIsIgnored(t *testing.T) {
 
 func TestExpiredLeaseRequeuesTask(t *testing.T) {
 	engine := NewEngine()
-	task := engine.Enqueue([]byte("first"))
+	task := enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(10 * time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -220,7 +220,7 @@ func TestExpiredLeaseRequeuesTask(t *testing.T) {
 
 func TestDoubleAckFails(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(time.Minute)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -242,10 +242,24 @@ func TestFetchEmptyQueueFails(t *testing.T) {
 	}
 }
 
+func TestEnqueueReturnsBackendError(t *testing.T) {
+	engine := newEngine(&failingEnqueueBackend{Backend: queue.NewMemoryQueue()})
+
+	task, err := engine.Enqueue([]byte("payload"))
+	if !errors.Is(err, errEnqueueFailed) {
+		t.Fatalf("enqueue returned task %+v and error %v, want errEnqueueFailed", task, err)
+	}
+
+	stats := engine.Stats()
+	if stats.Ready != 0 {
+		t.Fatalf("ready count = %d, want 0", stats.Ready)
+	}
+}
+
 func TestReapExpiredSkipsStaleHeapEntries(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
-	engine.Enqueue([]byte("second"))
+	enqueue(t, engine, []byte("first"))
+	enqueue(t, engine, []byte("second"))
 
 	first, err := engine.Fetch(time.Millisecond)
 	if err != nil {
@@ -293,7 +307,7 @@ func TestReapExpiredSkipsStaleHeapEntries(t *testing.T) {
 func TestReapExpiredDoesNotDeleteLeaseIfBackendRequeueFails(t *testing.T) {
 	backend := queue.NewMemoryQueue()
 	engine := newEngine(backend)
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -324,7 +338,7 @@ func TestReapExpiredDoesNotDeleteLeaseIfBackendRequeueFails(t *testing.T) {
 func TestReapExpiredRetriesFailedBackendRequeueLater(t *testing.T) {
 	backend := queue.NewMemoryQueue()
 	engine := newEngine(backend)
-	engine.Enqueue([]byte("first"))
+	enqueue(t, engine, []byte("first"))
 	lease, err := engine.Fetch(time.Millisecond)
 	if err != nil {
 		t.Fatalf("fetch returned error: %v", err)
@@ -381,9 +395,9 @@ func TestReapExpiredRetriesFailedBackendRequeueLater(t *testing.T) {
 
 func TestMultipleLeaseExpirationOrdering(t *testing.T) {
 	engine := NewEngine()
-	engine.Enqueue([]byte("first"))
-	engine.Enqueue([]byte("second"))
-	engine.Enqueue([]byte("third"))
+	enqueue(t, engine, []byte("first"))
+	enqueue(t, engine, []byte("second"))
+	enqueue(t, engine, []byte("third"))
 
 	first, err := engine.Fetch(10 * time.Millisecond)
 	if err != nil {
@@ -454,6 +468,25 @@ func TestMultipleLeaseExpirationOrdering(t *testing.T) {
 }
 
 var errRequeueFailed = errors.New("requeue failed")
+var errEnqueueFailed = errors.New("enqueue failed")
+
+func enqueue(t *testing.T, engine *Engine, payload []byte) Task {
+	t.Helper()
+
+	task, err := engine.Enqueue(payload)
+	if err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	return task
+}
+
+type failingEnqueueBackend struct {
+	queue.Backend
+}
+
+func (b *failingEnqueueBackend) Enqueue(Task) error {
+	return errEnqueueFailed
+}
 
 type failingRequeueBackend struct {
 	queue.Backend

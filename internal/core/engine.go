@@ -56,7 +56,7 @@ func newEngine(backend queue.Backend) *Engine {
 }
 
 // Enqueue creates a task and appends it to the ready queue.
-func (e *Engine) Enqueue(payload []byte) Task {
+func (e *Engine) Enqueue(payload []byte) (Task, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -65,10 +65,10 @@ func (e *Engine) Enqueue(payload []byte) Task {
 		Payload: cloneBytes(payload),
 	}
 	if err := e.ready.Enqueue(task); err != nil {
-		panic(err)
+		return Task{}, err
 	}
 
-	return cloneTask(task)
+	return cloneTask(task), nil
 }
 
 // Fetch leases one ready task for the provided timeout.

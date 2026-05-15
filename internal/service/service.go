@@ -41,7 +41,7 @@ func (s *Service) Enqueue(queueName string, payload []byte) (task.Task, error) {
 		return task.Task{}, err
 	}
 
-	return engine.Enqueue(payload), nil
+	return engine.Enqueue(payload)
 }
 
 // Fetch leases one task from a named queue.

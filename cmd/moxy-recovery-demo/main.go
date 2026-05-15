@@ -19,7 +19,8 @@ func main() {
 	}))
 
 	engine := core.NewEngine()
-	task := engine.Enqueue([]byte("charge invoice #4242"))
+	task, err := engine.Enqueue([]byte("charge invoice #4242"))
+	exitOnError(logger, "enqueue", err)
 	logger.Info("enqueue", "task_id", task.ID, "state", "READY")
 
 	lease, err := engine.Fetch(25 * time.Millisecond)
