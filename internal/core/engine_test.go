@@ -78,6 +78,81 @@ func TestAckRemovesLease(t *testing.T) {
 	}
 }
 
+func TestAckBeforeReapExpiredDoesNotRequeueTask(t *testing.T) {
+	engine := NewEngine()
+	engine.Enqueue([]byte("first"))
+	lease, err := engine.Fetch(time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch returned error: %v", err)
+	}
+
+	if err := engine.Ack(lease.LeaseID); err != nil {
+		t.Fatalf("ack returned error: %v", err)
+	}
+	requeued, err := engine.ReapExpired(lease.ExpiresAt.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("reap expired returned error: %v", err)
+	}
+	if requeued != 0 {
+		t.Fatalf("requeued count = %d, want 0", requeued)
+	}
+
+	stats := engine.Stats()
+	if stats.Ready != 0 || stats.Processing != 0 || stats.ActiveLeases != 0 || stats.Dead != 0 {
+		t.Fatalf("stats after ack-before-reap = %+v, want ready=0 processing=0 active=0 dead=0", stats)
+	}
+}
+
+func TestReapExpiredBeforeAckRequeuesTaskAndAckFails(t *testing.T) {
+	engine := NewEngine()
+	engine.Enqueue([]byte("first"))
+	lease, err := engine.Fetch(time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch returned error: %v", err)
+	}
+
+	requeued, err := engine.ReapExpired(lease.ExpiresAt.Add(time.Nanosecond))
+	if err != nil {
+		t.Fatalf("reap expired returned error: %v", err)
+	}
+	if requeued != 1 {
+		t.Fatalf("requeued count = %d, want 1", requeued)
+	}
+	if err := engine.Ack(lease.LeaseID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ack after reap returned %v, want ErrLeaseNotFound", err)
+	}
+
+	stats := engine.Stats()
+	if stats.Ready != 1 || stats.Processing != 0 || stats.ActiveLeases != 0 || stats.Dead != 0 {
+		t.Fatalf("stats after reap-before-ack = %+v, want ready=1 processing=0 active=0 dead=0", stats)
+	}
+}
+
+func TestReapExpiredBeforeAckDeadLettersWhenMaxAttemptsExceeded(t *testing.T) {
+	engine := NewEngineWithBackendAndConfig(queue.NewMemoryQueue(), EngineConfig{MaxAttempts: 1})
+	engine.Enqueue([]byte("first"))
+	lease, err := engine.Fetch(time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch returned error: %v", err)
+	}
+
+	requeued, err := engine.ReapExpired(lease.ExpiresAt.Add(time.Nanosecond))
+	if err != nil {
+		t.Fatalf("reap expired returned error: %v", err)
+	}
+	if requeued != 1 {
+		t.Fatalf("reap count = %d, want 1", requeued)
+	}
+	if err := engine.Ack(lease.LeaseID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ack after dead letter returned %v, want ErrLeaseNotFound", err)
+	}
+
+	stats := engine.Stats()
+	if stats.Ready != 0 || stats.Processing != 0 || stats.ActiveLeases != 0 || stats.Dead != 1 {
+		t.Fatalf("stats after reap-before-ack dead letter = %+v, want ready=0 processing=0 active=0 dead=1", stats)
+	}
+}
+
 func TestFetchInvalidTimeoutFails(t *testing.T) {
 	engine := NewEngine()
 	enqueue(t, engine, []byte("first"))
