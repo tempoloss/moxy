@@ -25,6 +25,9 @@ correctness model, then the network/protocol layer, and only later transparent
 Redis proxying and persistence. The current repo is already useful as a compact
 Go reference for reliable queue internals.
 
+Moxy is `v0.1.0-alpha` software. It is useful for learning, experiments, and
+small reliability-model prototypes, but it is not production-hardened yet.
+
 ## The Pain
 
 Plain Redis list consumption often starts with `LPOP`. It is fast, simple, and
@@ -115,6 +118,8 @@ to engines. Queue backends own task storage; the core engine owns lease metadata
 expiration scheduling.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper system notes.
+See [docs/redis-production-caveats.md](docs/redis-production-caveats.md) before
+using the Redis backend for anything beyond experimentation.
 
 ## Internal Commands
 
@@ -167,6 +172,7 @@ It is deterministic, easy to test, and useful for validating lease behavior.
 
 - `moxy:{queue}:ready`
 - `moxy:{queue}:processing`
+- `moxy:{queue}:dead`
 
 `Acquire` uses `LMOVE ready processing RIGHT LEFT`. `Complete` and `Requeue` use Lua
 scripts so finding a task by ID and removing or moving it happens atomically inside
