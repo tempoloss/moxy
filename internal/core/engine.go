@@ -6,8 +6,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tempoloss/moxy/internal/queue"
 	"github.com/google/uuid"
+	"github.com/tempoloss/moxy/internal/queue"
+	"github.com/tempoloss/moxy/internal/wal"
 )
 
 var (
@@ -27,10 +28,21 @@ type Stats struct {
 	ExpirationHeap int
 }
 
-// EngineConfig controls lease expiration behavior.
+// Journal records lease transitions durably so that they survive a restart.
+type Journal interface {
+	Append(record wal.Record) error
+}
+
+// EngineConfig controls lease expiration and durability.
 type EngineConfig struct {
 	MaxAttempts       int
 	RequeueRetryDelay time.Duration
+	// Journal, when set, receives every lease transition. Leaving it nil keeps
+	// the engine purely in memory, which is the right choice for tests and for
+	// workloads that can afford to replay from the source instead.
+	Journal Journal
+	// Recovered seeds lease state from a journal replay at startup.
+	Recovered []wal.Record
 }
 
 // Engine owns all mutable in-memory queue, lease, and expiration state.
@@ -40,6 +52,7 @@ type Engine struct {
 	leases      map[string]*Lease
 	expirations expirationHeap
 	config      EngineConfig
+	journal     Journal
 }
 
 // NewEngine creates an empty in-memory lease engine.
@@ -69,12 +82,42 @@ func newEngine(backend queue.Backend, configs ...EngineConfig) *Engine {
 		config.RequeueRetryDelay = requeueRetryDelay
 	}
 
-	return &Engine{
+	engine := &Engine{
 		ready:       backend,
 		leases:      make(map[string]*Lease),
 		expirations: expirations,
 		config:      config,
+		journal:     config.Journal,
 	}
+	engine.restore(config.Recovered)
+	return engine
+}
+
+// restore rebuilds lease state from a journal replay. A lease the journal still
+// shows as open is reinstated with its original expiry, so one that lapsed
+// while the process was down is reaped on the next pass instead of being handed
+// a fresh window it did not earn.
+func (e *Engine) restore(records []wal.Record) {
+	for _, record := range wal.Live(records) {
+		lease := &Lease{
+			LeaseID:   record.LeaseID,
+			Task:      cloneTask(record.Task),
+			CreatedAt: record.CreatedAt,
+			ExpiresAt: record.ExpiresAt,
+		}
+		e.leases[lease.LeaseID] = lease
+		heap.Push(&e.expirations, expirationItem{
+			LeaseID:   lease.LeaseID,
+			ExpiresAt: lease.ExpiresAt,
+		})
+	}
+}
+
+func (e *Engine) record(entry wal.Record) error {
+	if e.journal == nil {
+		return nil
+	}
+	return e.journal.Append(entry)
 }
 
 // Enqueue creates a task and appends it to the ready queue.
@@ -117,6 +160,23 @@ func (e *Engine) Fetch(timeout time.Duration) (*Lease, error) {
 		CreatedAt: now,
 		ExpiresAt: now.Add(timeout),
 	}
+
+	// Journal before the lease becomes visible. The task has already left the
+	// ready queue, so a failed write must hand it back rather than leave it in
+	// processing with no record that anyone holds it.
+	if err := e.record(wal.Record{
+		Op:        wal.OpFetch,
+		LeaseID:   lease.LeaseID,
+		Task:      lease.Task,
+		CreatedAt: lease.CreatedAt,
+		ExpiresAt: lease.ExpiresAt,
+	}); err != nil {
+		if requeueErr := e.ready.Requeue(task.ID); requeueErr != nil {
+			return nil, errors.Join(err, requeueErr)
+		}
+		return nil, err
+	}
+
 	e.leases[lease.LeaseID] = lease
 	heap.Push(&e.expirations, expirationItem{
 		LeaseID:   lease.LeaseID,
@@ -131,11 +191,19 @@ func (e *Engine) Ack(leaseID string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if _, ok := e.leases[leaseID]; !ok {
+	lease, ok := e.leases[leaseID]
+	if !ok {
 		return ErrLeaseNotFound
 	}
 
-	if err := e.ready.Complete(e.leases[leaseID].Task.ID); err != nil {
+	if err := e.ready.Complete(lease.Task.ID); err != nil {
+		return err
+	}
+	// Journal after the backend, not before. A crash in this gap leaves the
+	// journal claiming a lease that is already complete; the next reap tries to
+	// requeue it, the backend reports it is no longer processing, and the engine
+	// drops it. Writing the journal first would strand the task instead.
+	if err := e.record(wal.Record{Op: wal.OpAck, LeaseID: leaseID}); err != nil {
 		return err
 	}
 	delete(e.leases, leaseID)
@@ -179,11 +247,23 @@ func (e *Engine) ReapExpired(now time.Time) (int, error) {
 }
 
 func (e *Engine) expireLease(lease *Lease) error {
+	op := wal.OpExpire
+	var err error
 	if e.shouldDeadLetter(lease) {
-		return e.ready.DeadLetter(lease.Task.ID, "max attempts exceeded")
+		op = wal.OpDeadLetter
+		err = e.ready.DeadLetter(lease.Task.ID, "max attempts exceeded")
+	} else {
+		err = e.ready.Requeue(lease.Task.ID)
 	}
 
-	return e.ready.Requeue(lease.Task.ID)
+	// A task the backend no longer holds was already resolved — most often an
+	// ack that landed just before its journal write did not. Treat it as closed
+	// so the lease is released instead of being retried forever.
+	if err != nil && !errors.Is(err, queue.ErrTaskNotProcessing) {
+		return err
+	}
+
+	return e.record(wal.Record{Op: op, LeaseID: lease.LeaseID})
 }
 
 func (e *Engine) shouldDeadLetter(lease *Lease) bool {
