@@ -68,9 +68,13 @@ func (q *RedisQueue) Enqueue(task task.Task) error {
 	return q.client.LPush(context.Background(), q.readyKey, encoded).Err()
 }
 
-// Acquire atomically moves one task from ready to processing storage.
+// Acquire atomically moves one task from ready storage into the processing hash.
 func (q *RedisQueue) Acquire() (task.Task, error) {
-	encoded, err := q.client.LMove(context.Background(), q.readyKey, q.processingKey, "RIGHT", "LEFT").Result()
+	encoded, err := q.scripts.acquire.Run(
+		context.Background(),
+		q.client,
+		[]string{q.readyKey, q.processingKey},
+	).Text()
 	if errors.Is(err, redis.Nil) {
 		return task.Task{}, ErrQueueEmpty
 	}
@@ -83,7 +87,7 @@ func (q *RedisQueue) Acquire() (task.Task, error) {
 
 // Complete atomically removes a processing task.
 func (q *RedisQueue) Complete(taskID string) error {
-	found, err := q.runTaskScript(q.scripts.complete, taskID)
+	found, err := q.runTaskScript(q.scripts.complete, []string{q.processingKey}, taskID)
 	if err != nil {
 		return err
 	}
@@ -96,7 +100,7 @@ func (q *RedisQueue) Complete(taskID string) error {
 
 // Requeue atomically moves a processing task back to ready storage.
 func (q *RedisQueue) Requeue(taskID string) error {
-	found, err := q.runTaskScript(q.scripts.requeue, taskID)
+	found, err := q.runTaskScript(q.scripts.requeue, []string{q.processingKey, q.readyKey}, taskID)
 	if err != nil {
 		return err
 	}
@@ -109,16 +113,11 @@ func (q *RedisQueue) Requeue(taskID string) error {
 
 // DeadLetter atomically moves a processing task to dead-letter storage.
 func (q *RedisQueue) DeadLetter(taskID string, reason string) error {
-	needle, err := taskIDNeedle(taskID)
-	if err != nil {
-		return err
-	}
-
 	result, err := q.scripts.dead.Run(
 		context.Background(),
 		q.client,
 		[]string{q.processingKey, q.deadKey},
-		needle,
+		taskID,
 		reason,
 		time.Now().UTC().Format(time.RFC3339Nano),
 	).Int()
@@ -132,11 +131,11 @@ func (q *RedisQueue) DeadLetter(taskID string, reason string) error {
 	return nil
 }
 
-// Stats reports Redis ready, processing, and dead list lengths.
+// Stats reports the ready, processing, and dead counts.
 func (q *RedisQueue) Stats() Stats {
 	ctx := context.Background()
 	ready := q.client.LLen(ctx, q.readyKey).Val()
-	processing := q.client.LLen(ctx, q.processingKey).Val()
+	processing := q.client.HLen(ctx, q.processingKey).Val()
 	dead := q.client.LLen(ctx, q.deadKey).Val()
 
 	return Stats{
@@ -146,32 +145,13 @@ func (q *RedisQueue) Stats() Stats {
 	}
 }
 
-func (q *RedisQueue) runTaskScript(script *redis.Script, taskID string) (bool, error) {
-	needle, err := taskIDNeedle(taskID)
-	if err != nil {
-		return false, err
-	}
-
-	result, err := script.Run(
-		context.Background(),
-		q.client,
-		[]string{q.processingKey, q.readyKey},
-		needle,
-	).Int()
+func (q *RedisQueue) runTaskScript(script *redis.Script, keys []string, taskID string) (bool, error) {
+	result, err := script.Run(context.Background(), q.client, keys, taskID).Int()
 	if err != nil {
 		return false, err
 	}
 
 	return result == 1, nil
-}
-
-func taskIDNeedle(taskID string) (string, error) {
-	encoded, err := json.Marshal(taskID)
-	if err != nil {
-		return "", err
-	}
-
-	return `"id":` + string(encoded), nil
 }
 
 func encodeTask(item task.Task) (string, error) {
