@@ -53,6 +53,45 @@ requeued after the lease expires.
 | Testable core logic | Usually buried in worker code | Dedicated core package |
 | Backend choices | Redis list only | MemoryQueue and RedisQueue |
 | Protocol status | Redis commands today | RESP command path for Moxy commands |
+| Restart with leases held | Claims are lost, tasks stay stuck | Journal replays the open leases |
+
+## Lease Durability
+
+A lease is a claim: this worker holds this task until this moment. That claim
+used to live only in the engine's memory, so a restart lost it — and every task
+already moved into processing storage was stranded, because the reaper walks the
+in-memory expiration heap and cannot expire a lease it never saw.
+
+Every transition is now journalled to an append-only file before the lease
+becomes visible, and the journal is replayed on boot:
+
+```text
+[uint32 length][uint32 CRC32][payload]
+```
+
+A crash can tear the final frame, so replay stops at the first record that is
+short, fails its checksum, or does not decode, and truncates the file back to
+that boundary. A half-written record is discarded rather than poisoning
+recovery. Compaction rewrites the journal down to the still-open leases through
+a temporary file and a rename, so an interrupted compaction leaves either the
+old journal or the new one.
+
+Recovered leases keep their **original** deadline. One that lapsed while the
+process was down is reaped on the first pass instead of being handed a fresh
+window it never earned.
+
+Write ordering differs per operation, and the asymmetry is deliberate:
+
+| Operation | Order | Why |
+| --- | --- | --- |
+| Fetch | journal, then publish the lease | The task has already left ready storage; a failed write hands it back rather than leaving it held by nobody |
+| Ack | backend, then journal | A crash in the gap leaves a lease the next reap resolves — the backend reports the task is no longer processing and the engine releases it. The reverse order would strand the task |
+
+**What this does not cover.** The backend owns ready-queue durability, so a
+Redis configured to lose writes still loses tasks. And a task acquired in the
+moment before its journal write lands is not recovered; it stays in processing
+storage until an operator moves it. Closing that window needs a reconciliation
+pass over processing storage at boot, which is on the roadmap.
 
 ## 15-Second Recovery Demo
 
@@ -268,9 +307,7 @@ implemented yet:
 
 - Transparent Redis proxying
 - Full Redis command pass-through
-- WAL
-- snapshots
-- crash recovery
+- snapshots of backend contents
 - Redis Streams
 - distributed coordination
 - additional Redis-compatible commands beyond `PING` and `MOXY.*`
@@ -280,7 +317,7 @@ implemented yet:
 - Keep hardening the command/service boundary.
 - Add observability-friendly stats and structured errors.
 - Add transparent Redis pass-through after the Moxy command path stays boring.
-- Add persistence and crash recovery after the in-memory semantics remain boring.
+- Close the acquire-to-journal window by reconciling processing storage on boot.
 
 ## License
 

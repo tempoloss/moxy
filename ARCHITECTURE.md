@@ -30,6 +30,9 @@ internal/service
 
 internal/command
   Protocol-neutral command handler for future TCP/RESP integration.
+
+internal/wal
+  Append-only journal of lease transitions, replayed to rebuild lease state.
 ```
 
 ## Data Flow
@@ -93,10 +96,19 @@ Current guarantee:
 - Tasks should not silently disappear after a worker fetches them.
 - Expired leases return tasks to ready storage.
 
+Lease state survives a restart. Every transition is journalled before the lease
+becomes visible, and the journal is replayed on boot, so a lease held when the
+process died is reinstated with its original deadline rather than being lost
+with the task stuck in processing storage.
+
 Current non-guarantees:
 
-- No crash recovery yet.
-- No durable WAL or snapshots yet.
+- Recovery covers lease state, not the ready queue itself; the backend owns that
+  durability, so a Redis configured to lose writes still loses tasks.
+- A task acquired from the backend microseconds before a crash, in the window
+  before its journal write lands, is not recovered. It stays in processing
+  storage until an operator moves it.
+- No snapshots of backend contents.
 - No distributed coordination yet.
 - No user-facing Redis protocol yet.
 
