@@ -8,6 +8,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # The Redis-backed paths carry the Lua that moves tasks between ready,
+    # processing and dead storage. Without a live server those tests skip, and
+    # the scripts ship unexecuted.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      MOXY_REDIS_INTEGRATION: "1"
+      MOXY_REDIS_ADDR: "127.0.0.1:6379"
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -23,11 +41,17 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      - name: Vet
+        run: go vet ./...
+
       - name: Test
         run: go test ./...
 
-      - name: Vet
-        run: go vet ./...
+      # The engine mutates shared lease state from the caller and the reaper, so
+      # the detector is the check that matters most here. It needs cgo, which the
+      # Linux runner has even though a bare Windows checkout does not.
+      - name: Test with the race detector
+        run: go test -race ./...
 
       - name: Stress core tests
         run: go test ./internal/core -count=100
@@ -35,10 +59,11 @@ jobs:
       - name: Stress queue tests
         run: go test ./internal/queue -count=100
 
+      - name: Stress WAL tests
+        run: go test ./internal/wal -count=50
+
       - name: Stress service tests
         run: go test ./internal/service -count=100
 
       - name: Stress command tests
         run: go test ./internal/command -count=100
-
-      # Race tests are intentionally deferred until the local Windows setup has cgo/GCC available.
