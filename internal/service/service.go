@@ -9,6 +9,7 @@ import (
 	"github.com/tempoloss/moxy/internal/core"
 	"github.com/tempoloss/moxy/internal/queue"
 	"github.com/tempoloss/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/wal"
 )
 
 var ErrInvalidQueueName = errors.New("queue name must not be empty")
@@ -16,12 +17,20 @@ var ErrInvalidQueueName = errors.New("queue name must not be empty")
 // BackendFactory creates a queue backend for one named queue.
 type BackendFactory func(queueName string) queue.Backend
 
+// JournalFactory opens the lease journal for one named queue and returns any
+// lease state recovered from it. Each queue needs its own journal, so this is a
+// factory rather than a single shared handle.
+type JournalFactory func(queueName string) (core.Journal, []wal.Record, error)
+
 // Stats reports the state of one service-managed queue.
 type Stats = core.Stats
 
 // ServiceConfig controls engines created by the service.
 type ServiceConfig struct {
 	Engine core.EngineConfig
+	// Journal, when set, gives every queue a durable lease journal. Leaving it
+	// nil keeps lease state in memory only.
+	Journal JournalFactory
 }
 
 // Service owns multiple named queues.
@@ -127,7 +136,17 @@ func (s *Service) engineFor(queueName string) (*core.Engine, error) {
 		return engine, nil
 	}
 
-	engine = core.NewEngineWithBackendAndConfig(s.factory(queueName), s.config.Engine)
+	config := s.config.Engine
+	if s.config.Journal != nil {
+		journal, recovered, err := s.config.Journal(queueName)
+		if err != nil {
+			return nil, err
+		}
+		config.Journal = journal
+		config.Recovered = recovered
+	}
+
+	engine = core.NewEngineWithBackendAndConfig(s.factory(queueName), config)
 	s.engines[queueName] = engine
 	return engine, nil
 }
