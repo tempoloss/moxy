@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -23,15 +24,31 @@ import (
 	"github.com/tempoloss/moxy/internal/wal"
 )
 
-func main() {
-	addr := flag.String("addr", "127.0.0.1:6380", "TCP address to listen on")
-	backend := flag.String("backend", "memory", "queue backend: memory or redis")
-	redisAddr := flag.String("redis-addr", "localhost:6379", "Redis address for the redis backend")
-	walDir := flag.String("wal-dir", "", "directory for lease journals; empty keeps lease state in memory only")
-	flag.Parse()
+var version = "dev"
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+func main() {
+	os.Exit(run(context.Background(), os.Args[1:], os.Stdout))
+}
+
+func run(parent context.Context, args []string, stdout io.Writer) int {
+	flags := flag.NewFlagSet("moxy", flag.ContinueOnError)
+	flags.SetOutput(stdout)
+
+	addr := flags.String("addr", "127.0.0.1:6380", "TCP address to listen on")
+	backend := flags.String("backend", "memory", "queue backend: memory or redis")
+	redisAddr := flags.String("redis-addr", "localhost:6379", "Redis address for the redis backend")
+	walDir := flags.String("wal-dir", "", "directory for lease journals; empty keeps lease state in memory only")
+	showVersion := flags.Bool("version", false, "print version and exit")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *showVersion {
+		fmt.Fprintln(stdout, version)
+		return 0
+	}
+
+	logger := slog.New(slog.NewTextHandler(stdout, nil))
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	factory, closeBackend := buildBackendFactory(ctx, logger, *backend, *redisAddr)
@@ -46,12 +63,13 @@ func main() {
 
 	go reaper.Run(ctx, svc, time.Second)
 
-	logger.Info("Moxy listening", "addr", *addr, "backend", *backend, "wal_dir", *walDir)
+	logger.Info("Moxy listening", "version", version, "addr", *addr, "backend", *backend, "wal_dir", *walDir)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("server stopped with error", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	logger.Info("Moxy stopped")
+	return 0
 }
 
 func buildBackendFactory(ctx context.Context, logger *slog.Logger, backend, redisAddr string) (service.BackendFactory, func()) {

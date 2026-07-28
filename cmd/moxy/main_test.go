@@ -1,6 +1,28 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"context"
+	"testing"
+)
+
+func TestRunPrintsVersionAndExitsBeforeListening(t *testing.T) {
+	originalVersion := version
+	version = "v0.1.0-test"
+	t.Cleanup(func() {
+		version = originalVersion
+	})
+
+	var stdout bytes.Buffer
+	code := run(context.Background(), []string{"-version"}, &stdout)
+
+	if code != 0 {
+		t.Fatalf("run(-version) exit code = %d, want 0", code)
+	}
+	if got, want := stdout.String(), "v0.1.0-test\n"; got != want {
+		t.Fatalf("run(-version) stdout = %q, want %q", got, want)
+	}
+}
 
 func TestJournalFileNameRejectsNamesThatEscapeTheDirectory(t *testing.T) {
 	// Queue names arrive over the network and become file names, so anything

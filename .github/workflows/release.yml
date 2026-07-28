@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          targets=(
+            linux/amd64
+            linux/arm64
+            darwin/arm64
+            windows/amd64
+          )
+
+          for target in "${targets[@]}"; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            name="moxy_${tag}_${goos}_${goarch}"
+            outdir="dist/${name}"
+            exe="moxy"
+            if [[ "${goos}" == "windows" ]]; then
+              exe="moxy.exe"
+            fi
+
+            mkdir -p "${outdir}"
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${tag}" \
+              -o "${outdir}/${exe}" \
+              ./cmd/moxy
+
+            if [[ "${goos}" == "windows" ]]; then
+              python3 - "${outdir}" "dist/${name}.zip" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+src = pathlib.Path(sys.argv[1])
+dest = pathlib.Path(sys.argv[2])
+with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for path in sorted(src.rglob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(src.parent).as_posix())
+PY
+            else
+              tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            fi
+
+            rm -rf "${outdir}"
+          done
+
+          (
+            cd dist
+            sha256sum moxy_${tag}_*.tar.gz moxy_${tag}_*.zip > checksums.txt
+          )
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2.3.3
+        with:
+          name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/moxy_*.tar.gz
+            dist/moxy_*.zip
+            dist/checksums.txt
