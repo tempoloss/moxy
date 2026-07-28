@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/an8kk/moxy/internal/core"
-	"github.com/an8kk/moxy/internal/queue"
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/core"
+	"github.com/tempoloss/moxy/internal/queue"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 func TestEnqueueCreatesQueueLazily(t *testing.T) {

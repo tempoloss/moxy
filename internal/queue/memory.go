@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 // MemoryQueue stores ready tasks in memory using FIFO ordering.

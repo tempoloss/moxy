@@ -4,10 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/an8kk/moxy/internal/command"
-	"github.com/an8kk/moxy/internal/queue"
-	"github.com/an8kk/moxy/internal/resp"
-	"github.com/an8kk/moxy/internal/service"
+	"github.com/tempoloss/moxy/internal/command"
+	"github.com/tempoloss/moxy/internal/queue"
+	"github.com/tempoloss/moxy/internal/resp"
+	"github.com/tempoloss/moxy/internal/service"
 )
 
 func TestRESPPingReturnsPong(t *testing.T) {

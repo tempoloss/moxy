@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/an8kk/moxy/internal/command"
-	"github.com/an8kk/moxy/internal/queue"
-	"github.com/an8kk/moxy/internal/reaper"
-	"github.com/an8kk/moxy/internal/server"
-	"github.com/an8kk/moxy/internal/service"
+	"github.com/tempoloss/moxy/internal/command"
+	"github.com/tempoloss/moxy/internal/queue"
+	"github.com/tempoloss/moxy/internal/reaper"
+	"github.com/tempoloss/moxy/internal/server"
+	"github.com/tempoloss/moxy/internal/service"
 	"github.com/redis/go-redis/v9"
 )
 

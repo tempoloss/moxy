@@ -4,7 +4,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 var (

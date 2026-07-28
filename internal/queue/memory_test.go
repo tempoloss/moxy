@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 func TestMemoryQueueContract(t *testing.T) {

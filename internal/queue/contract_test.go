@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 type backendFactory func(t *testing.T) Backend

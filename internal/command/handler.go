@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/an8kk/moxy/internal/service"
+	"github.com/tempoloss/moxy/internal/service"
 )
 
 var (

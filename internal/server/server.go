@@ -8,9 +8,9 @@ import (
 	"net"
 	"sync"
 
-	"github.com/an8kk/moxy/internal/command"
-	"github.com/an8kk/moxy/internal/protocol"
-	"github.com/an8kk/moxy/internal/resp"
+	"github.com/tempoloss/moxy/internal/command"
+	"github.com/tempoloss/moxy/internal/protocol"
+	"github.com/tempoloss/moxy/internal/resp"
 )
 
 // Config controls the TCP server.

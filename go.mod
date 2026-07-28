@@ -1,4 +1,4 @@
-module github.com/an8kk/moxy
+module github.com/tempoloss/moxy
 
 go 1.26.2
 

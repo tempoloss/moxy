@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/an8kk/moxy/internal/task"
+	"github.com/tempoloss/moxy/internal/task"
 	"github.com/redis/go-redis/v9"
 )
 
