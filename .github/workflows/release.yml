@@ -56,17 +56,17 @@ jobs:
 
             if [[ "${goos}" == "windows" ]]; then
               python3 - "${outdir}" "dist/${name}.zip" <<'PY'
-import pathlib
-import sys
-import zipfile
+          import pathlib
+          import sys
+          import zipfile
 
-src = pathlib.Path(sys.argv[1])
-dest = pathlib.Path(sys.argv[2])
-with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-    for path in sorted(src.rglob("*")):
-        if path.is_file():
-            archive.write(path, path.relative_to(src.parent).as_posix())
-PY
+          src = pathlib.Path(sys.argv[1])
+          dest = pathlib.Path(sys.argv[2])
+          with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(src.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(src.parent).as_posix())
+          PY
             else
               tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             fi
