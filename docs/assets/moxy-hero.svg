@@ -1,6 +1,6 @@
 <svg width="1200" height="520" viewBox="0 0 1200 520" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">Moxy leased queue reliability diagram</title>
-  <desc id="desc">Industrial diagram showing Redis-style ready tasks moving through Moxy leases into processing, with expired work recovered back to ready.</desc>
+  <title id="title">Moxy leased queue diagram</title>
+  <desc id="desc">Diagram showing Redis-style ready tasks moving through Moxy leases into processing, with expired work recovered back to ready.</desc>
   <defs>
     <linearGradient id="panel" x1="80" y1="40" x2="1120" y2="480" gradientUnits="userSpaceOnUse">
       <stop stop-color="#0B1117"/>
@@ -59,6 +59,6 @@
   <text x="425" y="462" fill="#FBBF24" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="18" font-weight="700">expired lease requeues work automatically</text>
 
   <rect x="788" y="146" width="296" height="82" rx="12" fill="#0D151F" stroke="#2E4155"/>
-  <text x="812" y="178" fill="#F6F8FB" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">at-least-once delivery</text>
-  <text x="812" y="205" fill="#9FB0C4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="17">No silent task disappearance.</text>
+  <text x="812" y="178" fill="#F6F8FB" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">lease + requeue model</text>
+  <text x="812" y="205" fill="#9FB0C4" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="17">Expired leases requeue tasks.</text>
 </svg>

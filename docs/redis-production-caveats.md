@@ -5,7 +5,7 @@ and validating queue semantics, but it is not production-hardened yet.
 
 ## Delivery Semantics
 
-Moxy currently provides at-least-once delivery, not exactly-once delivery. A task
+Moxy's lease model is at-least-once oriented, not exactly-once oriented. A task
 can be delivered more than once after worker crashes, lease expiration,
 replication failover, or client retry behavior. Workers should be idempotent.
 
@@ -18,9 +18,10 @@ Moxy cannot provide stronger durability than the configured Redis persistence.
 - With AOF `appendfsync always`, Redis fsyncs every write and is safer, but
   slower.
 - RDB-only or loosely configured persistence can lose more queue state than a
-  durable queue workload usually expects.
+  persistent queue workload usually expects.
 
-Choose Redis persistence settings based on the durability required by the queue.
+Choose Redis persistence settings based on the data-loss window acceptable for
+the queue.
 
 ## Redis Eviction
 
@@ -67,6 +68,6 @@ safety feature, not full crash recovery.
 
 ## Streams
 
-Redis Streams are a valid alternative for reliable work queues. Consumer groups,
-pending entries, `XACK`, and reclaim operations may make Streams a better fit for
-some production systems. Moxy may explore a separate Redis Streams backend later.
+Redis Streams are a valid alternative for lease-aware work queues. Consumer
+groups, pending entries, `XACK`, and reclaim operations may make Streams a better
+fit for some systems. Moxy may explore a separate Redis Streams backend later.
