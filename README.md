@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/moxy-hero.svg" alt="Moxy leased queue reliability diagram" width="100%">
+  <img src="docs/assets/moxy-hero.svg" alt="Moxy leased queue diagram" width="100%">
 </p>
 
 <p align="center">
@@ -11,9 +11,9 @@
 
 # Moxy
 
-Moxy is a reliability layer for Redis-style queues. It adds leases, ACKs,
-visibility timeouts, and expiration recovery so tasks do not silently disappear
-when a worker dies.
+Moxy implements lease, ACK, visibility-timeout, and expiration-requeue
+mechanics for Redis-style queues so a worker crash can be modeled explicitly
+instead of hidden inside a plain pop operation.
 
 ```text
 READY -> PROCESSING -> ACKED
@@ -23,10 +23,10 @@ READY -> PROCESSING -> EXPIRED -> REQUEUED -> READY
 Moxy is an early-stage alpha project being built from the inside out: first the
 correctness model, then the network/protocol layer, and only later transparent
 Redis proxying and persistence. The current repo is already useful as a compact
-Go reference for reliable queue internals.
+Go reference for leased queue internals.
 
 Moxy is `v0.1.0-alpha` software. It is useful for learning, experiments, and
-small reliability-model prototypes, but it is not production-hardened yet.
+small lease-model prototypes, but it is not production-hardened yet.
 
 ## The Pain
 
@@ -53,7 +53,7 @@ requeued after the lease expires.
 | Testable core logic | Usually buried in worker code | Dedicated core package |
 | Backend choices | Redis list only | MemoryQueue and RedisQueue |
 | Protocol status | Redis commands today | RESP command path for Moxy commands |
-| Restart with leases held | Claims are lost, tasks stay stuck | Journal replays the open leases |
+| Restart with leases held | Claims are lost, tasks stay stuck | WAL replay restores open leases; see Lease Durability |
 
 ## Lease Durability
 
@@ -92,6 +92,19 @@ Redis configured to lose writes still loses tasks. And a task acquired in the
 moment before its journal write lands is not recovered; it stays in processing
 storage until an operator moves it. Closing that window needs a reconciliation
 pass over processing storage at boot, which is on the roadmap.
+
+The WAL mechanism is implemented in `internal/wal` and exercised by
+`internal/wal/wal_test.go` tests such as `TestRecordsSurviveReopen`,
+`TestTornTailIsDroppedAndTruncated`, and `TestCorruptChecksumStopsReplay`.
+Lease restoration is exercised in `internal/core/recovery_test.go` by
+`TestLeaseSurvivesRestart` and `TestRestoredLeaseKeepsItsOriginalDeadline`.
+
+## Limitations / Not Yet Proven
+
+Moxy has no in-repo load test, benchmark, failover drill, uptime history, or
+multi-node evidence. Treat the WAL and Redis Lua paths as implemented mechanisms,
+not as proof of operational maturity, availability guarantees, lossless
+delivery, or specific latency/throughput behavior.
 
 ## 15-Second Recovery Demo
 
@@ -323,5 +336,5 @@ implemented yet:
 
 Moxy is released under the [MIT License](LICENSE).
 
-The boring part is the point: a queue reliability layer should be legible,
+The boring part is the point: a leased queue coordinator should be legible,
 testable, and conservative before it becomes networked.

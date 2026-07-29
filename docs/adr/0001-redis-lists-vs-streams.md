@@ -13,7 +13,7 @@ The backend models tasks moving through explicit lifecycle storage:
 READY -> PROCESSING -> ACK/REQUEUE
 ```
 
-Redis Streams are also a valid Redis-native way to model reliable work queues.
+Redis Streams are also a valid Redis-native way to model lease-aware work queues.
 
 ## Decision
 
@@ -36,8 +36,8 @@ abstraction, and are a good educational first backend for Moxy's lease model.
 Redis Streams provide consumer groups, pending entries, `XACK`, `XAUTOCLAIM`,
 and built-in tools for inspecting and reclaiming stuck messages.
 
-Streams are more Redis-native for reliable work queues and may be a better fit
-for production-oriented deployments.
+Streams are more Redis-native for lease-aware work queues and may be a better
+fit for deployments that need Redis-native recovery controls.
 
 ## Consequences
 
