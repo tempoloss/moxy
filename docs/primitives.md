@@ -36,9 +36,9 @@ A Redis Lua script is code Redis runs inside the server, as one command from oth
 
 ### Redis lists rather than Redis streams
 
-Redis Streams have consumer groups, pending entries, `XACK`, and `XAUTOCLAIM`; they are a Redis-native way to inspect and reclaim leased work. Moxy deliberately starts with lists because the `READY -> PROCESSING -> ACK/REQUEUE` state machine is explicit, small, and maps directly to `queue.Backend`; the ADR leaves room for a future Streams backend behind the same interface.
+Redis Streams have consumer groups, pending entries, `XACK`, and `XAUTOCLAIM`; they are a Redis-native way to inspect and reclaim leased work. Moxy deliberately starts with plain data types instead — a list for what is waiting, a hash for what is claimed — because the `READY -> PROCESSING -> ACK/REQUEUE` state machine is then explicit, small, and maps directly to `queue.Backend`; the ADR leaves room for a future Streams backend behind the same interface.
 
-**Where:** `docs/adr/0001-redis-lists-vs-streams.md:20` - the accepted decision keeps the Redis backend on lists; `internal/queue/backend.go:29` - the engine only depends on the backend interface.
+**Where:** `docs/adr/0001-redis-lists-vs-streams.md:20` - the accepted decision keeps the Redis backend on plain data types; `internal/queue/backend.go:29` - the engine only depends on the backend interface.
 
 **What breaks if it is wrong:** 1) The code assumes Redis Streams semantics that lists do not have. 2) No pending-entry table exists for Redis to reclaim from. 3) Moxy's own WAL, reaper, and orphan reconciliation are bypassed or duplicated. 4) Recovery behavior becomes two partial designs instead of one.
 
