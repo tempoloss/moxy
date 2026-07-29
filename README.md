@@ -243,15 +243,17 @@ It is deterministic, easy to test, and useful for validating lease behavior.
 
 ### RedisQueue
 
-`RedisQueue` stores ready and processing tasks in Redis lists:
+`RedisQueue` keeps what is waiting in a list and what is claimed in a hash:
 
-- `moxy:{queue}:ready`
-- `moxy:{queue}:processing`
-- `moxy:{queue}:dead`
+- `moxy:{queue}:ready` — list; tasks are taken with `RPOP` and returned with `LPUSH`
+- `moxy:{queue}:processing` — hash keyed by task id
+- `moxy:{queue}:dead` — list
 
-`Acquire` uses `LMOVE ready processing RIGHT LEFT`. `Complete` and `Requeue` use Lua
-scripts so finding a task by ID and removing or moving it happens atomically inside
-Redis.
+`Acquire` runs one Lua script that does `RPOP` off the ready list and `HSET` into
+the processing hash, so no crash can land between the two. `Complete`, `Requeue`
+and startup reclamation are Lua scripts as well, and they address a task by id in
+the hash rather than scanning a list — which is the reason processing is a hash
+and not a second list. `LMOVE` would fit list-to-list and is deliberately unused.
 
 ```go
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})

@@ -12,7 +12,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisQueue stores ready and processing tasks in Redis lists.
+// RedisQueue stores ready and dead tasks in Redis lists, and in-flight tasks in
+// a hash keyed by task id so ACK, requeue and reclamation address one task
+// directly instead of scanning a list. See docs/adr/0001-redis-lists-vs-streams.md.
 type RedisQueue struct {
 	client        *redis.Client
 	readyKey      string
