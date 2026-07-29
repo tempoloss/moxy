@@ -33,5 +33,9 @@ type Backend interface {
 	Complete(taskID string) error
 	Requeue(taskID string) error
 	DeadLetter(taskID string, reason string) error
+	// RecoverOrphanedProcessing moves processing tasks that are not covered by
+	// recovered active leases back to ready storage without incrementing
+	// attempts. It is a startup-only reconciliation step after WAL replay.
+	RecoverOrphanedProcessing(activeTaskIDs map[string]struct{}) (int, error)
 	Stats() Stats
 }

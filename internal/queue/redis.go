@@ -131,6 +131,23 @@ func (q *RedisQueue) DeadLetter(taskID string, reason string) error {
 	return nil
 }
 
+// RecoverOrphanedProcessing atomically returns processing tasks without a
+// recovered active lease to ready storage. Unlike expiry requeueing, recovery
+// does not increment attempts because no durable lease reached a worker.
+func (q *RedisQueue) RecoverOrphanedProcessing(activeTaskIDs map[string]struct{}) (int, error) {
+	args := make([]any, 0, len(activeTaskIDs))
+	for taskID := range activeTaskIDs {
+		args = append(args, taskID)
+	}
+
+	return q.scripts.recoverOrphans.Run(
+		context.Background(),
+		q.client,
+		[]string{q.processingKey, q.readyKey},
+		args...,
+	).Int()
+}
+
 // Stats reports the ready, processing, and dead counts.
 func (q *RedisQueue) Stats() Stats {
 	ctx := context.Background()

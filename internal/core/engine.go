@@ -12,9 +12,10 @@ import (
 )
 
 var (
-	ErrQueueEmpty     = queue.ErrQueueEmpty
-	ErrLeaseNotFound  = errors.New("lease does not exist")
-	ErrInvalidTimeout = errors.New("lease timeout must be positive")
+	ErrQueueEmpty         = queue.ErrQueueEmpty
+	ErrLeaseNotFound      = errors.New("lease does not exist")
+	ErrInvalidTimeout     = errors.New("lease timeout must be positive")
+	ErrRecoveryIncomplete = errors.New("recovery reconciliation failed")
 )
 
 const requeueRetryDelay = time.Second
@@ -53,6 +54,7 @@ type Engine struct {
 	expirations expirationHeap
 	config      EngineConfig
 	journal     Journal
+	recoveryErr error
 }
 
 // NewEngine creates an empty in-memory lease engine.
@@ -89,16 +91,23 @@ func newEngine(backend queue.Backend, configs ...EngineConfig) *Engine {
 		config:      config,
 		journal:     config.Journal,
 	}
-	engine.restore(config.Recovered)
+	activeTaskIDs := engine.restore(config.Recovered)
+	if err := engine.recoverOrphanedProcessing(activeTaskIDs); err != nil {
+		engine.recoveryErr = errors.Join(ErrRecoveryIncomplete, err)
+	}
 	return engine
 }
 
 // restore rebuilds lease state from a journal replay. A lease the journal still
 // shows as open is reinstated with its original expiry, so one that lapsed
 // while the process was down is reaped on the next pass instead of being handed
-// a fresh window it did not earn.
-func (e *Engine) restore(records []wal.Record) {
-	for _, record := range wal.Live(records) {
+// a fresh window it did not earn. It returns the task IDs covered by those
+// recovered leases so backend processing entries outside that set can be
+// reconciled.
+func (e *Engine) restore(records []wal.Record) map[string]struct{} {
+	live := wal.Live(records)
+	activeTaskIDs := make(map[string]struct{}, len(live))
+	for _, record := range live {
 		lease := &Lease{
 			LeaseID:   record.LeaseID,
 			Task:      cloneTask(record.Task),
@@ -106,11 +115,22 @@ func (e *Engine) restore(records []wal.Record) {
 			ExpiresAt: record.ExpiresAt,
 		}
 		e.leases[lease.LeaseID] = lease
+		activeTaskIDs[lease.Task.ID] = struct{}{}
 		heap.Push(&e.expirations, expirationItem{
 			LeaseID:   lease.LeaseID,
 			ExpiresAt: lease.ExpiresAt,
 		})
 	}
+	return activeTaskIDs
+}
+
+func (e *Engine) recoverOrphanedProcessing(activeTaskIDs map[string]struct{}) error {
+	_, err := e.ready.RecoverOrphanedProcessing(activeTaskIDs)
+	return err
+}
+
+func (e *Engine) ensureRecovered() error {
+	return e.recoveryErr
 }
 
 func (e *Engine) record(entry wal.Record) error {
@@ -124,6 +144,9 @@ func (e *Engine) record(entry wal.Record) error {
 func (e *Engine) Enqueue(payload []byte) (Task, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.ensureRecovered(); err != nil {
+		return Task{}, err
+	}
 
 	task := Task{
 		ID:      uuid.NewString(),
@@ -143,6 +166,9 @@ func (e *Engine) Fetch(timeout time.Duration) (*Lease, error) {
 
 	if timeout <= 0 {
 		return nil, ErrInvalidTimeout
+	}
+	if err := e.ensureRecovered(); err != nil {
+		return nil, err
 	}
 
 	task, err := e.ready.Acquire()
@@ -190,6 +216,9 @@ func (e *Engine) Fetch(timeout time.Duration) (*Lease, error) {
 func (e *Engine) Ack(leaseID string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.ensureRecovered(); err != nil {
+		return err
+	}
 
 	lease, ok := e.leases[leaseID]
 	if !ok {
@@ -214,6 +243,9 @@ func (e *Engine) Ack(leaseID string) error {
 func (e *Engine) ReapExpired(now time.Time) (int, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if err := e.ensureRecovered(); err != nil {
+		return 0, err
+	}
 
 	requeued := 0
 	for {

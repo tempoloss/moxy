@@ -37,6 +37,9 @@ func RunBackendContractTests(t *testing.T, factory backendFactory) {
 	t.Run("RequeueMissingProcessingTaskFails", func(t *testing.T) {
 		testRequeueMissingProcessingTaskFails(t, factory)
 	})
+	t.Run("RecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease", func(t *testing.T) {
+		testRecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease(t, factory)
+	})
 	t.Run("DeadLetterMovesProcessingTaskToDead", func(t *testing.T) {
 		testDeadLetterMovesProcessingTaskToDead(t, factory)
 	})
@@ -200,6 +203,53 @@ func testRequeueIncrementsAttempts(t *testing.T, factory backendFactory) {
 	}
 	if again.Attempts != 3 {
 		t.Fatalf("attempts after requeue = %d, want 3", again.Attempts)
+	}
+}
+
+func testRecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "active", Attempts: 2}); err != nil {
+		t.Fatalf("enqueue active task returned error: %v", err)
+	}
+	if err := backend.Enqueue(task.Task{ID: "orphan", Attempts: 5, Payload: []byte("payload")}); err != nil {
+		t.Fatalf("enqueue orphan task returned error: %v", err)
+	}
+
+	active, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire active task returned error: %v", err)
+	}
+	orphan, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire orphan task returned error: %v", err)
+	}
+
+	moved, err := backend.RecoverOrphanedProcessing(map[string]struct{}{active.ID: {}})
+	if err != nil {
+		t.Fatalf("recover orphaned processing returned error: %v", err)
+	}
+	if moved != 1 {
+		t.Fatalf("recovered orphan count = %d, want 1", moved)
+	}
+	if got := backend.Stats(); got.Ready != 1 || got.Processing != 1 {
+		t.Fatalf("stats after orphan recovery = %+v, want ready=1 processing=1", got)
+	}
+	if err := backend.Complete(active.ID); err != nil {
+		t.Fatalf("complete active task after orphan recovery returned error: %v", err)
+	}
+
+	recovered, err := backend.Acquire()
+	if err != nil {
+		t.Fatalf("acquire recovered orphan returned error: %v", err)
+	}
+	if recovered.ID != orphan.ID {
+		t.Fatalf("recovered orphan ID = %q, want %q", recovered.ID, orphan.ID)
+	}
+	if recovered.Attempts != orphan.Attempts {
+		t.Fatalf("recovered orphan attempts = %d, want %d", recovered.Attempts, orphan.Attempts)
+	}
+	if string(recovered.Payload) != "payload" {
+		t.Fatalf("recovered orphan payload = %q, want payload", recovered.Payload)
 	}
 }
 

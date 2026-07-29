@@ -81,6 +81,25 @@ func (q *MemoryQueue) Requeue(taskID string) error {
 	return nil
 }
 
+// RecoverOrphanedProcessing returns processing tasks without a recovered active
+// lease to ready storage. These tasks were acquired by the backend but never
+// durably leased, so returning them must not burn a retry attempt.
+func (q *MemoryQueue) RecoverOrphanedProcessing(activeTaskIDs map[string]struct{}) (int, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	moved := 0
+	for taskID, task := range q.processing {
+		if _, active := activeTaskIDs[taskID]; active {
+			continue
+		}
+		delete(q.processing, taskID)
+		q.ready = append(q.ready, cloneTask(task))
+		moved++
+	}
+	return moved, nil
+}
+
 // DeadLetter moves a processing task into dead-letter storage.
 func (q *MemoryQueue) DeadLetter(taskID string, reason string) error {
 	q.mu.Lock()

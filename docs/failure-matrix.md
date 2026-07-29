@@ -14,6 +14,9 @@ The queue backends expose these atomic transitions to the engine:
 - `Complete`: processing -> removed/completed.
 - `Requeue`: processing -> ready, incrementing `attempts`.
 - `DeadLetter`: processing -> dead, incrementing `attempts`.
+- `RecoverOrphanedProcessing`: startup-only processing -> ready for processing
+  entries that are not covered by recovered WAL leases. It does not increment
+  `attempts` because no durable lease reached a worker.
 
 The WAL stores length-prefixed CRC records. `Open` replays intact records,
 discards the first torn or corrupt tail record, and truncates the file to the
@@ -39,9 +42,9 @@ Ordered steps:
 | Boundary | Where the task is after restart | Can it be lost? | Can it be delivered twice? | Reconciler | Guarantee | Test coverage |
 | --- | --- | --- | --- | --- | --- | --- |
 | F0: before backend `Acquire` starts | Still ready in the backend; no WAL record; no active lease. | No. | No. | Client retry fetches it. | At-least-once. | `TestFetchCrashBoundaryBeforeBackendAcquireLeavesTaskReady` |
-| F1: after backend `Acquire`, before any fetch WAL bytes are durable | In backend processing; no recovered active lease. It is stranded because the reaper only sees leases restored from memory/WAL. | Not deleted from the backend, but operationally lost until manual repair because no engine state can reap it. | No; it is not deliverable at all. | None in current code. This is a named weakness. | Neither useful at-least-once nor useful at-most-once; it is at-most-once only by stranding. | `TestFetchCrashBoundaryAfterBackendAcquireBeforeJournalStrandsTask` |
-| F2: crash during fetch WAL write, leaving a torn final fetch record | Earlier intact WAL records recover. The task for the torn fetch record remains in backend processing with no active lease. The WAL is truncated to the last good record. | Same weakness as F1 for the torn task: not deleted, but stranded. | No for the torn task. Earlier recovered leases can be redelivered after their original deadline. | WAL truncates the torn tail. No component reconciles the processing task whose fetch record was torn. | Torn task has no useful delivery guarantee; earlier intact leases remain at-least-once. | `TestTornFinalFetchRecordIsDroppedAndOnlyEarlierLeasesRecover` |
-| F3: after a complete fetch record is written, before fsync returns | If the complete record survives on disk, recovery restores the active lease with the original deadline while the backend still has the task in processing. If the record is absent or torn, this collapses to F1/F2. | Only in the absent/torn disk-state branch; a surviving complete record prevents stranding. | Yes after the original deadline if the client also received the lease or kept doing work elsewhere. | Recovery restores the lease; reaper requeues after the original deadline. | Conditional: at-least-once only if the fetch record survived. No fsync means no durability promise. | `TestFetchCrashBoundaryAfterAppendBeforeFsyncRestoresIfRecordSurvives`; lost/torn branches covered by F1/F2 tests. |
+| F1: after backend `Acquire`, before any fetch WAL bytes are durable | Returned to ready by startup processing reconciliation; no recovered active lease is created because no fetch record survived. | No. | No from the crashed fetch because no lease was published; a later fetch can deliver it once. | Startup `RecoverOrphanedProcessing` reconciles backend processing entries not covered by recovered leases. | At-least-once for the task; no retry attempt is charged during reconciliation. | `TestFetchCrashBoundaryAfterBackendAcquireBeforeJournalRequeuesOrphan` |
+| F2: crash during fetch WAL write, leaving a torn final fetch record | Earlier intact WAL records recover with their original deadlines. The torn fetch record is discarded and truncated; its processing task has no recovered lease and is returned to ready. | No. | No for the torn task from the crashed fetch. Earlier recovered leases can be redelivered after their original deadline. | WAL truncates the torn tail; startup `RecoverOrphanedProcessing` reconciles the processing task whose fetch record was torn. | At-least-once for the torn task; earlier intact leases remain at-least-once with original deadlines. | `TestTornFinalFetchRecordIsDroppedAndOrphanedTaskIsRequeued` |
+| F3: after a complete fetch record is written, before fsync returns | If the complete record survives on disk, recovery restores the active lease with the original deadline while the backend still has the task in processing. If the record is absent or torn, startup reconciliation returns the orphaned processing task to ready. | No. | Yes in the surviving-record branch after the original deadline if work continued elsewhere; no in the absent/torn branch from the crashed fetch. | Recovery restores surviving records; startup `RecoverOrphanedProcessing` handles absent/torn branches. | At-least-once. No fsync means no promise about whether recovery preserves the original deadline or immediately makes the task ready. | `TestFetchCrashBoundaryAfterAppendBeforeFsyncRestoresIfRecordSurvives`; absent/torn branches covered by F1/F2 tests. |
 | F4: after fsync, before in-memory lease publication | Backend processing plus durable fetch WAL record. Restart restores one active lease and one expiration heap entry with the original deadline. | No. | Yes after the original deadline if work is retried or the original worker resumes. | Recovery restores; reaper redelivers only after the preserved deadline. | At-least-once, not at-most-once. | `TestFetchCrashBoundaryAfterFsyncBeforeMemoryPublishRestoresOriginalDeadline` |
 | F5: after in-memory lease publication, before the fetch reply reaches the client | Same as F4 after restart: backend processing plus recovered active lease. If the client never saw the reply, the task waits until the original deadline and is then requeued. | No. | Possible after the deadline if a worker did receive the lease but the response/connection failed ambiguously. | Recovery plus reaper; client retry may fetch after requeue. | At-least-once, not at-most-once. | `TestFetchCrashBoundaryAfterLeasePublishBeforeReplyUsesOriginalDeadline` |
 | F6: after the fetch reply reaches the client | Same durable state as F5. The client may ack before expiry after restart; otherwise the reaper requeues after the original deadline. | No, assuming the fetch record was fsynced. | Yes if the original client continues past the lease deadline and the task is requeued. | Client ack or reaper. | At-least-once, not at-most-once. | Covered by the same durable-state tests as F5 and existing recovery tests. |
@@ -71,14 +74,17 @@ Ordered steps:
 
 ## Findings
 
-- The fetch window between backend `Acquire` and a durable fetch WAL record can
-  strand a task in backend processing with no recovered lease. A torn final
-  fetch record has the same stranded-task outcome for that task. This matrix does
-  not paper over that weakness.
-- Unsynced append windows are explicitly conditional. A complete record that
-  happens to survive can be recovered; an absent or torn record cannot be treated
-  as durable.
+- Startup recovery now reconciles backend `processing` against the WAL's
+  recovered live leases. Processing tasks with no recovered lease are returned to
+  `ready` without incrementing `attempts`, closing F1 and F2 as at-least-once
+  windows instead of stranded-task windows.
+- Unsynced append windows are explicitly conditional. A complete fetch record
+  that happens to survive can be recovered with its original deadline; an absent
+  or torn fetch record is not treated as durable and falls back to startup
+  processing reconciliation.
 - The ack path favors not resurrecting completed work. If backend completion
   lands but the ack record does not, the restored lease is stale. The client may
   see an error when retrying ack before the reaper runs, but the reaper closes
-  the stale lease without requeueing the completed task.
+  the stale lease without requeueing the completed task. If the ack did become
+  durable, recovery folds the lease closed and there is no backend processing
+  entry for startup reconciliation to return to ready.

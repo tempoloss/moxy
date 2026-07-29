@@ -11,18 +11,20 @@ import "github.com/redis/go-redis/v9"
 // encoded JSON by substring quietly depended on Go's field ordering. A hash
 // makes every one of those transitions a single O(1) field lookup.
 type redisQueueScripts struct {
-	acquire  *redis.Script
-	complete *redis.Script
-	requeue  *redis.Script
-	dead     *redis.Script
+	acquire        *redis.Script
+	complete       *redis.Script
+	requeue        *redis.Script
+	dead           *redis.Script
+	recoverOrphans *redis.Script
 }
 
 func defaultRedisQueueScripts() redisQueueScripts {
 	return redisQueueScripts{
-		acquire:  redis.NewScript(acquireTaskScript),
-		complete: redis.NewScript(completeTaskScript),
-		requeue:  redis.NewScript(requeueTaskScript),
-		dead:     redis.NewScript(deadLetterTaskScript),
+		acquire:        redis.NewScript(acquireTaskScript),
+		complete:       redis.NewScript(completeTaskScript),
+		requeue:        redis.NewScript(requeueTaskScript),
+		dead:           redis.NewScript(deadLetterTaskScript),
+		recoverOrphans: redis.NewScript(recoverOrphanedProcessingScript),
 	}
 }
 
@@ -68,6 +70,30 @@ local task = cjson.decode(encoded)
 task["attempts"] = (task["attempts"] or 0) + 1
 redis.call("LPUSH", ready, cjson.encode(task))
 return 1
+`
+
+const recoverOrphanedProcessingScript = `
+local processing = KEYS[1]
+local ready = KEYS[2]
+
+local active = {}
+for i = 1, #ARGV do
+	active[ARGV[i]] = true
+end
+
+local entries = redis.call("HGETALL", processing)
+local moved = 0
+for i = 1, #entries, 2 do
+	local id = entries[i]
+	local encoded = entries[i + 1]
+	if not active[id] then
+		redis.call("HDEL", processing, id)
+		redis.call("LPUSH", ready, encoded)
+		moved = moved + 1
+	end
+end
+
+return moved
 `
 
 const deadLetterTaskScript = `
