@@ -105,13 +105,22 @@ backend operation, the journal append, the fsync, the lease publication and the
 reply, it states where the task ends up after restart, whether it can be lost or
 delivered twice, who reconciles it, and which test proves it.
 
-Read it before relying on Moxy for anything. It names a real weakness rather
-than hiding it: a crash after the backend acquire but before any fetch WAL bytes
-are durable (window `F1`, and the torn-record case `F2`) leaves the task in
-backend processing with no recovered lease, so nothing reaps it and no component
-in the current code reconciles it. That window is at-most-once only by
-stranding, and closing it needs a change to the storage protocol order, not a
-patch.
+Read it before relying on Moxy for anything. The window that used to be its named
+weakness is now closed: a crash after the backend acquire but before any fetch
+WAL bytes are durable (`F1`, and the torn-record case `F2`) left the task in
+backend `processing` with no recovered lease, so nothing reaped it. Startup
+recovery now reconciles the backend against the leases the journal restored: a
+processing task with no recovered lease cannot be held by anyone, because its
+holder died with the process, so it returns to `ready` without being charged an
+attempt. `RecoverOrphanedProcessing` does the move atomically inside each
+backend, including a Lua script for Redis.
+
+The guarantee across those windows is at-least-once, not exactly-once: a task can
+be delivered twice if a recovered lease passes its preserved deadline while work
+continues elsewhere. Reconciliation runs only during recovery, never
+periodically, so it cannot requeue a task a live worker still holds under a valid
+lease — `internal/core/crash_matrix_test.go` asserts both that and that a durably
+acknowledged task is never resurrected.
 
 ## Limitations / Not Yet Proven
 
