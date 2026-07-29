@@ -99,6 +99,20 @@ The WAL mechanism is implemented in `internal/wal` and exercised by
 Lease restoration is exercised in `internal/core/recovery_test.go` by
 `TestLeaseSurvivesRestart` and `TestRestoredLeaseKeepsItsOriginalDeadline`.
 
+Where a crash leaves a task is enumerated per boundary in
+[`docs/failure-matrix.md`](docs/failure-matrix.md): for each window between the
+backend operation, the journal append, the fsync, the lease publication and the
+reply, it states where the task ends up after restart, whether it can be lost or
+delivered twice, who reconciles it, and which test proves it.
+
+Read it before relying on Moxy for anything. It names a real weakness rather
+than hiding it: a crash after the backend acquire but before any fetch WAL bytes
+are durable (window `F1`, and the torn-record case `F2`) leaves the task in
+backend processing with no recovered lease, so nothing reaps it and no component
+in the current code reconciles it. That window is at-most-once only by
+stranding, and closing it needs a change to the storage protocol order, not a
+patch.
+
 ## Limitations / Not Yet Proven
 
 Moxy has no in-repo load test, benchmark, failover drill, uptime history, or
