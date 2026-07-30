@@ -2,7 +2,7 @@
 
 This document names the low-level mechanisms Moxy rests on and explains why the code is shaped around them. Each entry is anchored to real code or an existing design document so the claim can be checked instead of trusted.
 
-The line-by-line annotations behind these entries live in [`primitives.code.json`](primitives.code.json): the cited ranges, the note lines, and a fingerprint of the code each one was written against. `python3 scripts/check_primitives_anchors.py` fails when an anchor in this file or in that one no longer points at the code it describes, and CI runs it on every push.
+The line-by-line annotations behind these entries live in [`primitives.code.json`](primitives.code.json): the cited ranges, the note lines, and a fingerprint of the code each one was written against. `python3 scripts/check_primitives_anchors.py` fails when an anchor in this file or in that one no longer points at the code it describes. The Primitives workflow runs it on every push, re-anchors a pure line shift by matching content instead of line numbers, and pushes that repair back, so only a substantive code change needs a person.
 
 ## Redis
 
