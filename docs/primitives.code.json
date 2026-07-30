@@ -1,0 +1,1635 @@
+{
+ "schema": 1,
+ "repo": "moxy",
+ "cards": [
+  {
+   "title": "Redis list pop (`LPOP`/`RPOP`) deletes",
+   "walk": "При Fetch Redis backend запускает Lua-переход, который берёт элемент из ready через RPOP. В Redis pop сразу удаляет этот элемент из списка, поэтому следующая операция должна немедленно записать тот же payload в processing. Важный порядок: возврат задачи в Go происходит только после того, как Redis уже убрал её из ready и проиндексировал в processing.",
+   "snippets": [
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 31,
+     "end": 46,
+     "sha256": "3b2857a927f0aac308f048182336bd2b667a1609d1a614276d043fe865a0fc20",
+     "first": "// acquireTaskScript moves the oldest ready task into the processing hash. The",
+     "last": "`",
+     "why": "Здесь реализован момент, где pop из ready удаляет задачу и тот же скрипт сразу переносит её в processing.",
+     "notes": [
+      {
+       "line": 31,
+       "code": "// acquireTaskScript moves the oldest ready task into the processing hash. The",
+       "text": "Комментарий задаёт смысл скрипта: это не чтение очереди, а переход ready -> processing."
+      },
+      {
+       "line": 38,
+       "code": "local encoded = redis.call(\"RPOP\", ready)",
+       "text": "RPOP возвращает самый старый ready-элемент и одновременно удаляет его из Redis list; после этой строки задачи уже нет в ready."
+      },
+      {
+       "line": 39,
+       "code": "if not encoded then",
+       "text": "Пустой результат останавливает переход до любых записей в processing, поэтому пустая очередь не создаёт фантомную lease."
+      },
+      {
+       "line": 43,
+       "code": "local task = cjson.decode(encoded)",
+       "text": "Декодирование нужно только чтобы достать task id для точного индекса processing."
+      },
+      {
+       "line": 44,
+       "code": "redis.call(\"HSET\", processing, task[\"id\"], encoded)",
+       "text": "HSET кладёт тот же encoded payload в processing под task id, закрывая дыру, которую оставил бы отдельный RPOP без записи."
+      },
+      {
+       "line": 45,
+       "code": "return encoded",
+       "text": "Go получает encoded task уже после Redis-перехода; caller не держит копию ready-элемента, которую можно было бы восстановить без backend."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Ready, processing, and dead storage",
+   "walk": "RedisQueue держит три разные области хранения для разных стадий жизни задачи. Конструктор строит отдельные ключи для ready, processing и dead, а Lua-комментарий объясняет, почему processing индексируется hash по task id. Благодаря этому Ack, Requeue и DeadLetter находят ровно одну processing-задачу, а не сканируют и не угадывают по JSON.",
+   "snippets": [
+    {
+     "file": "internal/queue/redis.go",
+     "start": 18,
+     "end": 50,
+     "sha256": "c6d07a7e177e776cb5292c7c960192b544eb91a3c0c80ac05e251a30341ddffb",
+     "first": "type RedisQueue struct {",
+     "last": "}",
+     "why": "Этот тип и builder ключей показывают, что backend физически разделяет ready, processing и dead storage.",
+     "notes": [
+      {
+       "line": 20,
+       "code": "readyKey      string",
+       "text": "readyKey указывает на хранилище задач, которые ещё можно выдать worker'у."
+      },
+      {
+       "line": 21,
+       "code": "processingKey string",
+       "text": "processingKey отделён от ready, поэтому выданная lease не остаётся среди задач для нового Fetch."
+      },
+      {
+       "line": 22,
+       "code": "deadKey       string",
+       "text": "deadKey хранит задачи, которые вышли из retry loop и больше не должны возвращаться в ready."
+      },
+      {
+       "line": 43,
+       "code": "func newRedisQueueKeys(queueName string) redisQueueKeys {",
+       "text": "newRedisQueueKeys централизует схему имён, чтобы все операции backend били в одни и те же lifecycle buckets."
+      },
+      {
+       "line": 47,
+       "code": "ready:      prefix + \":ready\",",
+       "text": "Суффикс :ready делает список ожидающей работы отдельным Redis key."
+      },
+      {
+       "line": 48,
+       "code": "processing: prefix + \":processing\",",
+       "text": "Суффикс :processing даёт hash/область для задач с активной или восстанавливаемой lease."
+      },
+      {
+       "line": 49,
+       "code": "dead:       prefix + \":dead\",",
+       "text": "Суффикс :dead отделяет poison work от очереди, которую читают worker'ы."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 5,
+     "end": 12,
+     "sha256": "97044ed2269ee9aef7d4a67388af627dcf9a1de8bf299b9bc5472b8d45004ea2",
+     "first": "// Processing tasks are held in a hash keyed by task id rather than a list.",
+     "last": "// makes every one of those transitions a single O(1) field lookup.",
+     "why": "Этот комментарий фиксирует ключевую форму processing: hash по task id вместо списка, который пришлось бы сканировать.",
+     "notes": [
+      {
+       "line": 5,
+       "code": "// Processing tasks are held in a hash keyed by task id rather than a list.",
+       "text": "Processing выбран hash keyed by task id, поэтому complete/requeue/dead-letter адресуют одну запись."
+      },
+      {
+       "line": 7,
+       "code": "// A list forces every transition to scan: the earlier implementation pulled the",
+       "text": "Здесь описана старая форма через processing list, где переходы начинались со сканирования всего списка."
+      },
+      {
+       "line": 9,
+       "code": "// for the task id. That is O(n) per ack, requeue and dead-letter, it runs inside",
+       "text": "O(n) внутри Lua опасен тем, что блокирует Redis server на время поиска."
+      },
+      {
+       "line": 11,
+       "code": "// encoded JSON by substring quietly depended on Go's field ordering. A hash",
+       "text": "Substring-match по encoded JSON был скрытой зависимостью от порядка полей, то есть мог выбрать не ту задачу."
+      },
+      {
+       "line": 12,
+       "code": "// makes every one of those transitions a single O(1) field lookup.",
+       "text": "Hash превращает каждый lifecycle transition в O(1) lookup по id."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Redis Lua scripts / `EVAL`",
+   "walk": "Go-код не собирает переход из нескольких Redis-команд вручную: он запускает заранее подготовленный redis.Script. Redis исполняет Lua как один server-side command, поэтому RPOP и HSET внутри script не могут быть interleaved другим клиентом. После завершения script Go только декодирует уже перемещённую задачу.",
+   "snippets": [
+    {
+     "file": "internal/queue/redis.go",
+     "start": 73,
+     "end": 88,
+     "sha256": "6069e593227eb97164c9626958ca1dad50eca51013cfcd44a80860ddf2c1807d",
+     "first": "// Acquire atomically moves one task from ready storage into the processing hash.",
+     "last": "}",
+     "why": "Acquire показывает Go-точку входа: backend вызывает cached Lua script вместо отдельных Redis calls.",
+     "notes": [
+      {
+       "line": 73,
+       "code": "// Acquire atomically moves one task from ready storage into the processing hash.",
+       "text": "Комментарий называет операцию atomic move, то есть контракт backend — один неделимый переход."
+      },
+      {
+       "line": 75,
+       "code": "encoded, err := q.scripts.acquire.Run(",
+       "text": "Run запускает redis.Script; дальше порядок операций контролирует Redis Lua, а не Go между сетевыми round-trip'ами."
+      },
+      {
+       "line": 78,
+       "code": "[]string{q.readyKey, q.processingKey},",
+       "text": "В KEYS передаются ready и processing, так что script видит обе стороны перехода одновременно."
+      },
+      {
+       "line": 80,
+       "code": "if errors.Is(err, redis.Nil) {",
+       "text": "redis.Nil мапится в ErrQueueEmpty: пустая ready list не считается частично выполненным переходом."
+      },
+      {
+       "line": 87,
+       "code": "return decodeTask(encoded)",
+       "text": "Декодирование в Go происходит после script, когда Redis уже завершил atomic transition."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 31,
+     "end": 46,
+     "sha256": "3b2857a927f0aac308f048182336bd2b667a1609d1a614276d043fe865a0fc20",
+     "first": "// acquireTaskScript moves the oldest ready task into the processing hash. The",
+     "last": "`",
+     "why": "Эта Lua-константа содержит две операции, которые должны быть одним EVAL-переходом: pop из ready и запись в processing.",
+     "notes": [
+      {
+       "line": 31,
+       "code": "// acquireTaskScript moves the oldest ready task into the processing hash. The",
+       "text": "Скрипт именует переход acquireTaskScript: это backend Acquire, а не вспомогательная проверка."
+      },
+      {
+       "line": 32,
+       "code": "// pop and the index write have to land together, or a crash between them loses",
+       "text": "Комментарий прямо говорит, что pop и index write должны landed together; иначе crash между ними теряет задачу."
+      },
+      {
+       "line": 38,
+       "code": "local encoded = redis.call(\"RPOP\", ready)",
+       "text": "RPOP берёт и удаляет payload из ready list внутри Redis."
+      },
+      {
+       "line": 44,
+       "code": "redis.call(\"HSET\", processing, task[\"id\"], encoded)",
+       "text": "HSET пишет тот же payload в processing hash до выхода из Lua script."
+      },
+      {
+       "line": 45,
+       "code": "return encoded",
+       "text": "Возврат encoded наружу происходит только после обоих Redis-side шагов."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Redis lists rather than Redis streams",
+   "walk": "Абстракция queue.Backend описывает маленькую state machine, а не Redis Streams consumer group. Redis implementation зашивает эту machine в list/hash Lua transitions: ready извлекается list pop, processing хранится hash, закрытия идут отдельными методами. Поэтому Streams можно заменить будущим backend'ом, но текущий Engine не зависит от XACK, XAUTOCLAIM или pending entries.",
+   "snippets": [
+    {
+     "file": "internal/queue/backend.go",
+     "start": 29,
+     "end": 40,
+     "sha256": "a14e0d4b55c91636a176cced18428deec857d9e038aeaa3978b106d71c9b4a6f",
+     "first": "// Backend is the minimal ready-queue storage boundary used by the core engine.",
+     "last": "Stats() Stats",
+     "why": "Интерфейс показывает границу, ради которой выбран простой lifecycle backend вместо Redis Streams API.",
+     "notes": [
+      {
+       "line": 29,
+       "code": "// Backend is the minimal ready-queue storage boundary used by the core engine.",
+       "text": "Backend назван minimal storage boundary: Engine видит состояния, а не Redis Streams primitives."
+      },
+      {
+       "line": 31,
+       "code": "Enqueue(task task.Task) error",
+       "text": "Enqueue — явный вход в ready storage, без stream append semantics вроде consumer groups."
+      },
+      {
+       "line": 32,
+       "code": "Acquire() (task.Task, error)",
+       "text": "Acquire — отдельный ready -> processing переход, который backend обязан реализовать сам."
+      },
+      {
+       "line": 33,
+       "code": "Complete(taskID string) error",
+       "text": "Complete закрывает processing task напрямую, а не через XACK."
+      },
+      {
+       "line": 34,
+       "code": "Requeue(taskID string) error",
+       "text": "Requeue выражает повторную доставку как processing -> ready, не как claim pending entry."
+      },
+      {
+       "line": 36,
+       "code": "// RecoverOrphanedProcessing moves processing tasks that are not covered by",
+       "text": "RecoverOrphanedProcessing — собственная startup recovery primitive, которую Streams могли бы заменить другим механизмом."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 31,
+     "end": 46,
+     "sha256": "3b2857a927f0aac308f048182336bd2b667a1609d1a614276d043fe865a0fc20",
+     "first": "// acquireTaskScript moves the oldest ready task into the processing hash. The",
+     "last": "`",
+     "why": "Текущий Redis backend реализует Acquire через list pop plus hash write, а не через stream consumer-group commands.",
+     "notes": [
+      {
+       "line": 38,
+       "code": "local encoded = redis.call(\"RPOP\", ready)",
+       "text": "RPOP доказывает, что ready storage здесь Redis list."
+      },
+      {
+       "line": 43,
+       "code": "local task = cjson.decode(encoded)",
+       "text": "Payload декодируется только для id; Streams message id или consumer name в переходе не участвуют."
+      },
+      {
+       "line": 44,
+       "code": "redis.call(\"HSET\", processing, task[\"id\"], encoded)",
+       "text": "Processing записывается как hash field, что сохраняет явную state machine за интерфейсом Backend."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Fetch moves in the backend before it journals",
+   "walk": "Fetch сначала валидирует timeout и вызывает backend Acquire, который уже передвинул задачу из ready в processing. Только после этого Engine строит Lease и вызывает record для wal.OpFetch. Промежуток между Acquire и durable journal record — это crash window F1: задача уже ушла из ready, но восстановление ещё не видит lease, поэтому startup reconciliation должен вернуть orphan processing task.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 162,
+     "end": 205,
+     "sha256": "98f51d81ede7166dbbcb8820352059cb61eb04734261115fb2293460484bb25f",
+     "first": "// Fetch leases one ready task for the provided timeout.",
+     "last": "",
+     "why": "В одном self-contained Fetch видно оба load-bearing шага: backend Acquire на ранней строке и WAL record на более поздней строке.",
+     "notes": [
+      {
+       "line": 163,
+       "code": "func (e *Engine) Fetch(timeout time.Duration) (*Lease, error) {",
+       "text": "Fetch — публичная операция, в которой возникает F1/F2 ordering window."
+      },
+      {
+       "line": 167,
+       "code": "if timeout <= 0 {",
+       "text": "Timeout проверяется до side effects, чтобы invalid request не двигал backend state."
+      },
+      {
+       "line": 174,
+       "code": "task, err := e.ready.Acquire()",
+       "text": "Это первый необратимый шаг: e.ready.Acquire() уже выполняет ready -> processing в backend до любой WAL-записи."
+      },
+      {
+       "line": 182,
+       "code": "now := time.Now()",
+       "text": "Deadline считается после backend move, поэтому lease state ещё только строится в памяти."
+      },
+      {
+       "line": 187,
+       "code": "ExpiresAt: now.Add(timeout),",
+       "text": "ExpiresAt фиксирует original visibility deadline, который попадёт в WAL и recovery."
+      },
+      {
+       "line": 190,
+       "code": "// Journal before the lease becomes visible. The task has already left the",
+       "text": "Комментарий намеренно фиксирует «The task has already left the ready queue»: journal идёт после backend, а не до него."
+      },
+      {
+       "line": 193,
+       "code": "if err := e.record(wal.Record{",
+       "text": "Только здесь начинается запись wal.OpFetch; gap между line 174 и этой записью — crash window F1."
+      },
+      {
+       "line": 200,
+       "code": "if requeueErr := e.ready.Requeue(task.ID); requeueErr != nil {",
+       "text": "Если обычный record call возвращает ошибку, Engine пытается hand it back через Requeue; crash в F1 не доходит до этой компенсации."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Startup reconciliation of orphaned processing tasks",
+   "walk": "При старте Engine сначала восстанавливает live leases из WAL и строит set task id, которые действительно покрыты durable fetch records. Затем он вызывает backend RecoverOrphanedProcessing для всего processing, чего в этом set нет. Memory backend делает enumerate-and-move под mutex, а Redis backend делает тот же обход и перенос целиком внутри Lua, не read-then-write из Go.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 87,
+     "end": 129,
+     "sha256": "e95bd3cefa25009836ba4e73df058ecfea8d122e5b262d6646867afe27da5fae",
+     "first": "engine := &Engine{",
+     "last": "return err",
+     "why": "Этот участок показывает порядок startup: восстановить WAL leases, затем передать active task ids в backend reconciliation.",
+     "notes": [
+      {
+       "line": 94,
+       "code": "activeTaskIDs := engine.restore(config.Recovered)",
+       "text": "restore(config.Recovered) складывает durable WAL state в activeTaskIDs до любого backend orphan move."
+      },
+      {
+       "line": 95,
+       "code": "if err := engine.recoverOrphanedProcessing(activeTaskIDs); err != nil {",
+       "text": "recoverOrphanedProcessing вызывается строго после restore, поэтому backend получает уже известные live processing tasks."
+      },
+      {
+       "line": 101,
+       "code": "// restore rebuilds lease state from a journal replay. A lease the journal still",
+       "text": "Комментарий объясняет, что restore восстанавливает open lease с original expiry, а не создаёт новый claim."
+      },
+      {
+       "line": 108,
+       "code": "live := wal.Live(records)",
+       "text": "wal.Live сворачивает fetch/ack/expire/dead_letter stream в только открытые lease records."
+      },
+      {
+       "line": 117,
+       "code": "e.leases[lease.LeaseID] = lease",
+       "text": "Recovered lease публикуется в in-memory map, чтобы reaper снова мог управлять этой processing task."
+      },
+      {
+       "line": 119,
+       "code": "heap.Push(&e.expirations, expirationItem{",
+       "text": "Heap item создаётся для recovered lease, иначе deadline не будет reaped после restart."
+      },
+      {
+       "line": 127,
+       "code": "func (e *Engine) recoverOrphanedProcessing(activeTaskIDs map[string]struct{}) error {",
+       "text": "Отдельная функция делает startup-only reconciliation явной границей Engine -> backend."
+      },
+      {
+       "line": 128,
+       "code": "_, err := e.ready.RecoverOrphanedProcessing(activeTaskIDs)",
+       "text": "Backend получает activeTaskIDs и сам решает, какие processing entries являются orphaned."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/memory.go",
+     "start": 84,
+     "end": 100,
+     "sha256": "9b197c0d135cb2fea3743460902faefbc9144863b6e91413b3d8835d317082ce",
+     "first": "// RecoverOrphanedProcessing returns processing tasks without a recovered active",
+     "last": "return moved, nil",
+     "why": "Memory backend показывает ту же orphan recovery семантику под одним mutex, полезную как readable contract implementation.",
+     "notes": [
+      {
+       "line": 84,
+       "code": "// RecoverOrphanedProcessing returns processing tasks without a recovered active",
+       "text": "Комментарий задаёт startup-only смысл: вернуть processing без recovered active lease."
+      },
+      {
+       "line": 88,
+       "code": "q.mu.Lock()",
+       "text": "Mutex делает enumerate-and-move атомарным относительно других MemoryQueue операций в тестовом backend."
+      },
+      {
+       "line": 92,
+       "code": "for taskID, task := range q.processing {",
+       "text": "Перебор идёт по current processing map, а не по ready, потому что stranded task уже была acquired."
+      },
+      {
+       "line": 93,
+       "code": "if _, active := activeTaskIDs[taskID]; active {",
+       "text": "Если taskID covered by WAL active lease, backend оставляет её в processing."
+      },
+      {
+       "line": 96,
+       "code": "delete(q.processing, taskID)",
+       "text": "Orphan удаляется из processing перед возвратом в ready, чтобы задача не была в двух местах."
+      },
+      {
+       "line": 97,
+       "code": "q.ready = append(q.ready, cloneTask(task))",
+       "text": "Append в ready возвращает orphan без Attempts++, потому что durable lease не дошла до worker."
+      },
+      {
+       "line": 100,
+       "code": "return moved, nil",
+       "text": "Возвращаемый moved count делает reconciliation observable для tests/diagnostics."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 75,
+     "end": 97,
+     "sha256": "bd42dfac941b2701b3faba7d8b2804f9825cfa7fef4f90b981e3a733550efb2f",
+     "first": "const recoverOrphanedProcessingScript = `",
+     "last": "`",
+     "why": "Redis implementation держит enumerate-and-move внутри одного Lua script, поэтому Go не читает processing и потом отдельно пишет ready.",
+     "notes": [
+      {
+       "line": 75,
+       "code": "const recoverOrphanedProcessingScript = `",
+       "text": "recoverOrphanedProcessingScript — отдельный startup Lua transition, не reuse обычного Requeue."
+      },
+      {
+       "line": 79,
+       "code": "local active = {}",
+       "text": "ARGV превращается в active set внутри Redis script, чтобы фильтр был local to atomic execution."
+      },
+      {
+       "line": 84,
+       "code": "local entries = redis.call(\"HGETALL\", processing)",
+       "text": "HGETALL перечисляет processing entries внутри Redis, а не возвращает их Go-коду для ручного move."
+      },
+      {
+       "line": 86,
+       "code": "for i = 1, #entries, 2 do",
+       "text": "Loop шагает по id/value парам hash, сохраняя точное соответствие task id -> encoded task."
+      },
+      {
+       "line": 89,
+       "code": "if not active[id] then",
+       "text": "Только processing entries без recovered lease считаются orphaned."
+      },
+      {
+       "line": 90,
+       "code": "redis.call(\"HDEL\", processing, id)",
+       "text": "HDEL удаляет orphan из processing внутри того же script execution."
+      },
+      {
+       "line": 91,
+       "code": "redis.call(\"LPUSH\", ready, encoded)",
+       "text": "LPUSH возвращает тот же encoded payload в ready без Attempts++, потому что это recovery, не retry."
+      },
+      {
+       "line": 96,
+       "code": "return moved",
+       "text": "Lua возвращает moved count после завершения всех atomic moves."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "`write` is not `fsync`",
+   "walk": "Append сначала кодирует WAL record в frame и отдаёт bytes ядру через Write. Только если Log открыт с Sync=true, следующий шаг вызывает file.Sync, который просит OS протолкнуть dirty data на storage. Поэтому успешный Write сам по себе не является durability boundary; crash до fsync может оставить полный, torn или отсутствующий final record.",
+   "snippets": [
+    {
+     "file": "internal/wal/wal.go",
+     "start": 61,
+     "end": 66,
+     "sha256": "d7a0d986d1af65c81b2f1ec0a653746591634c3069dce9cccb9ac0275a6b089e",
+     "first": "// Options controls durability.",
+     "last": "}",
+     "why": "Options.Sync задаёт, будет ли append ждать fsync или остановится на обычном write.",
+     "notes": [
+      {
+       "line": 61,
+       "code": "// Options controls durability.",
+       "text": "Options отделяет API durability policy от механики записи frame."
+      },
+      {
+       "line": 63,
+       "code": "// Sync fsyncs after every append. Leaving it off trades crash durability",
+       "text": "Комментарий прямо говорит: Sync fsyncs after every append, то есть durability требует отдельного системного вызова."
+      },
+      {
+       "line": 64,
+       "code": "// for throughput and is intended for tests and throwaway runs.",
+       "text": "Без Sync это throughput tradeoff: байты могут быть в page cache, но не обещаны после power loss."
+      }
+     ]
+    },
+    {
+     "file": "internal/wal/wal.go",
+     "start": 124,
+     "end": 140,
+     "sha256": "264245b16de586f6d2f6b539ccd188234c5a06656e6e592a00ef367f26b59bd2",
+     "first": "// Append writes one record and, when configured to, fsyncs it.",
+     "last": "}",
+     "why": "Append показывает два разных этапа: обычный Write frame и последующий Sync как durability barrier.",
+     "notes": [
+      {
+       "line": 126,
+       "code": "frame, err := encode(record)",
+       "text": "Сначала Record превращается в WAL frame; durability ещё не началась."
+      },
+      {
+       "line": 130,
+       "code": "if _, err := l.file.Write(frame); err != nil {",
+       "text": "file.Write означает, что kernel принял bytes, но это ещё не fsync и не power-loss guarantee."
+      },
+      {
+       "line": 133,
+       "code": "if l.sync {",
+       "text": "Ветка l.sync разделяет тестовый/throughput режим и default durable WAL."
+      },
+      {
+       "line": 134,
+       "code": "if err := l.file.Sync(); err != nil {",
+       "text": "file.Sync — load-bearing boundary: после него append обещает durable record настолько, насколько это даёт filesystem."
+      },
+      {
+       "line": 138,
+       "code": "l.offset += int64(len(frame))",
+       "text": "offset продвигается только после write/sync path, чтобы future append начинался за записанным frame."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "WAL length and CRC frames",
+   "walk": "WAL record сначала сериализуется в payload, затем вокруг него строится fixed header. Первые четыре байта header — длина payload, следующие четыре — CRC32 именно этого payload. Replay потом может знать, сколько bytes читать, и проверить, что эти bytes не были torn или corrupted.",
+   "snippets": [
+    {
+     "file": "internal/wal/wal.go",
+     "start": 242,
+     "end": 255,
+     "sha256": "0cea1c5cad9be0d30fe89e0a7884b39524bb8b5da35eebac2c24329525637c28",
+     "first": "func encode(record Record) ([]byte, error) {",
+     "last": "return frame, nil",
+     "why": "encode — единственное место, где WAL frame получает length header, checksum header и payload bytes.",
+     "notes": [
+      {
+       "line": 243,
+       "code": "payload, err := json.Marshal(record)",
+       "text": "Record превращается в JSON payload; CRC считается по этим exact bytes."
+      },
+      {
+       "line": 247,
+       "code": "if len(payload) > maxRecordBytes {",
+       "text": "Предел размера защищает replay от bogus length, который потребовал бы огромную allocation."
+      },
+      {
+       "line": 251,
+       "code": "frame := make([]byte, headerSize+len(payload))",
+       "text": "Frame выделяется как headerSize plus payload, поэтому header и body записываются одним contiguous buffer."
+      },
+      {
+       "line": 252,
+       "code": "binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))",
+       "text": "Первые 4 bytes header — little-endian payload length; replay узнаёт границу следующего record."
+      },
+      {
+       "line": 253,
+       "code": "binary.LittleEndian.PutUint32(frame[4:headerSize], crc32.ChecksumIEEE(payload))",
+       "text": "Следующие 4 bytes — CRC32 checksum payload; replay отличает intact payload от bit-rot/torn write."
+      },
+      {
+       "line": 254,
+       "code": "copy(frame[headerSize:], payload)",
+       "text": "Payload копируется после header; без этой fixed layout replay не смог бы безопасно шагать по журналу."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Torn tail replay",
+   "walk": "OpenWith запускает replay и получает offset последнего intact record. Всё после этого offset считается torn tail: последняя запись была обрезана, имеет невозможную длину, плохой checksum или не декодируется. Затем WAL truncates file back to good boundary, потому что skip невозможен безопасно: после повреждения неизвестно, где начинается следующий валидный frame, и чтение дальше могло бы принять мусор за lease state.",
+   "snippets": [
+    {
+     "file": "internal/wal/wal.go",
+     "start": 77,
+     "end": 116,
+     "sha256": "1bd29ee66a3a35993fd5f56bc4a4760c391f8cbabe15bddb90761dab0b042266",
+     "first": "// Open opens (or creates) the journal at path, replays it, and truncates any",
+     "last": "}, nil",
+     "why": "OpenWith показывает, как replay result становится физическим truncation back to last good WAL boundary.",
+     "notes": [
+      {
+       "line": 77,
+       "code": "// Open opens (or creates) the journal at path, replays it, and truncates any",
+       "text": "Комментарий задаёт startup contract: Open replays and truncates any torn tail."
+      },
+      {
+       "line": 96,
+       "code": "records, good, err := replay(file)",
+       "text": "replay возвращает records и good offset — позицию сразу после последнего intact frame."
+      },
+      {
+       "line": 101,
+       "code": "if err := file.Truncate(good); err != nil {",
+       "text": "Truncate(good) удаляет torn tail: это обрезанная или corrupt последняя запись; её нельзя просто skip, потому что frame boundary после повреждения недостоверна."
+      },
+      {
+       "line": 105,
+       "code": "if _, err := file.Seek(good, io.SeekStart); err != nil {",
+       "text": "Seek(good) ставит следующий append ровно за последним valid record, а не после мусора."
+      },
+      {
+       "line": 114,
+       "code": "offset:    good,",
+       "text": "Log.offset запоминает тот же good boundary для дальнейших writes and compaction."
+      }
+     ]
+    },
+    {
+     "file": "internal/wal/wal.go",
+     "start": 260,
+     "end": 304,
+     "sha256": "17e6a8f51d44a7fbadf9eefe9cd550dbe0a9a1f7e39b7134d792d41b0d302e3d",
+     "first": "func replay(file *os.File) ([]Record, int64, error) {",
+     "last": "}",
+     "why": "replay показывает все условия, при которых WAL stops at the first non-intact frame and reports the last good offset.",
+     "notes": [
+      {
+       "line": 260,
+       "code": "func replay(file *os.File) ([]Record, int64, error) {",
+       "text": "replay принимает решение, где остановиться, и возвращает recovered records вместе с last-good offset."
+      },
+      {
+       "line": 273,
+       "code": "if _, err := io.ReadFull(reader, header[:]); err != nil {",
+       "text": "Header читается через ReadFull, поэтому partial header immediately means final torn frame."
+      },
+      {
+       "line": 274,
+       "code": "if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {",
+       "text": "EOF и ErrUnexpectedEOF не fatal для recovery; они означают clean end или torn tail."
+      },
+      {
+       "line": 275,
+       "code": "return records, good, nil",
+       "text": "Возврат records, good останавливает replay без попытки лечить или перескочить повреждённый хвост."
+      },
+      {
+       "line": 282,
+       "code": "if length == 0 || length > maxRecordBytes {",
+       "text": "Нулевая или слишком большая length считается corrupt frame; replay stops before allocation beyond limit."
+      },
+      {
+       "line": 287,
+       "code": "if _, err := io.ReadFull(reader, payload); err != nil {",
+       "text": "Payload тоже читается ReadFull, так что короткое тело не декодируется как half JSON."
+      },
+      {
+       "line": 293,
+       "code": "if crc32.ChecksumIEEE(payload) != checksum {",
+       "text": "CRC mismatch доказывает, что payload bytes не те, которые были encoded."
+      },
+      {
+       "line": 298,
+       "code": "if err := json.Unmarshal(payload, &record); err != nil {",
+       "text": "Даже correct length/checksum должны decoded as Record; иначе lease state не доверяется."
+      },
+      {
+       "line": 303,
+       "code": "good += headerSize + int64(length)",
+       "text": "good продвигается только после полного успешного frame, поэтому truncation никогда не режет intact record."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "WAL compaction through temp file and rename",
+   "walk": "Compact перечитывает журнал, оставляет только live fetch records и записывает replacement в отдельный temp file. Этот temp file fsync'ится и закрывается до того, как старый handle отпускается. После этого rename атомарно переключает имя журнала на готовую замену, вместо рискованного in-place edit старого файла.",
+   "snippets": [
+    {
+     "file": "internal/wal/wal.go",
+     "start": 147,
+     "end": 190,
+     "sha256": "24f1ab42b9f84cdf23f13dde46735d88861f8b24e91e042610feed7152e93138",
+     "first": "// Compact rewrites the journal with one fetch record per still-open lease,",
+     "last": "if err := file.Close(); err != nil {",
+     "why": "Первая половина Compact показывает, что compacted journal пишется в отдельный temp file and fsynced before replacement.",
+     "notes": [
+      {
+       "line": 147,
+       "code": "// Compact rewrites the journal with one fetch record per still-open lease,",
+       "text": "Compaction starts from one fetch record per still-open lease, not arbitrary truncation of old history."
+      },
+      {
+       "line": 149,
+       "code": "// through a temporary file and a rename so a crash mid-compaction leaves either",
+       "text": "Комментарий формулирует crash-safety цель: old journal или new one, never partial one."
+      },
+      {
+       "line": 157,
+       "code": "live := Live(records)",
+       "text": "wal.Live вычисляет semantic state, которое нужно сохранить после удаления closed history."
+      },
+      {
+       "line": 164,
+       "code": "temporary := l.path + \".compact\"",
+       "text": "temporary path отделяет rewrite от live WAL path."
+      },
+      {
+       "line": 165,
+       "code": "file, err := os.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)",
+       "text": "O_TRUNC применяется к temp file, а не к текущему journal; crash здесь не портит старый WAL."
+      },
+      {
+       "line": 172,
+       "code": "frame, err := encode(live[id])",
+       "text": "Каждая live lease заново encoded as normal WAL frame, сохраняя length/CRC формат."
+      },
+      {
+       "line": 178,
+       "code": "if _, err := file.Write(frame); err != nil {",
+       "text": "Write идёт в temp file; partial compacted bytes ещё не видны как основной journal."
+      },
+      {
+       "line": 185,
+       "code": "if err := file.Sync(); err != nil {",
+       "text": "Sync temp file перед rename уменьшает риск получить имя нового journal без durable contents."
+      }
+     ]
+    },
+    {
+     "file": "internal/wal/wal.go",
+     "start": 195,
+     "end": 211,
+     "sha256": "aaff04a979caa9626c31677afcb9828e295e9f1c8c3d37015e6acb58ec18e9e9",
+     "first": "// The live handle must go before the rename: Windows refuses to replace a",
+     "last": "return nil",
+     "why": "Вторая половина Compact показывает close-before-rename and os.Rename replacement boundary.",
+     "notes": [
+      {
+       "line": 195,
+       "code": "// The live handle must go before the rename: Windows refuses to replace a",
+       "text": "Старый handle закрывается перед replace; на Windows открытый файл нельзя заменить безопасно."
+      },
+      {
+       "line": 201,
+       "code": "if err := os.Rename(temporary, l.path); err != nil {",
+       "text": "os.Rename атомарно переключает pathname: после crash reader видит старый файл или полностью подготовленный replacement, а in-place edit мог бы оставить половину live records."
+      },
+      {
+       "line": 205,
+       "code": "reopened, err := os.OpenFile(l.path, os.O_RDWR|os.O_APPEND, 0o644)",
+       "text": "После rename WAL открывается заново уже на compacted file, чтобы future appends шли в replacement."
+      },
+      {
+       "line": 210,
+       "code": "l.offset = written",
+       "text": "offset становится длиной записанных compacted frames, а не старого journal."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Engine mutex",
+   "walk": "Engine собирает mutable state в одном объекте: backend, map активных leases, expiration heap и recovery error. Операции вроде Fetch берут e.mu перед проверкой recovery, backend transition и mutation in-memory structures. Поэтому concurrent clients не могут одновременно менять map и heap или увидеть interleaved состояние lease lifecycle.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 49,
+     "end": 58,
+     "sha256": "9f904c257d54a6ea1b1f016a8945300cbd3a63e05dbd0ab48ad43cf34656e5d5",
+     "first": "// Engine owns all mutable in-memory queue, lease, and expiration state.",
+     "last": "}",
+     "why": "Структура Engine показывает, какие mutable fields защищает один mutex.",
+     "notes": [
+      {
+       "line": 49,
+       "code": "// Engine owns all mutable in-memory queue, lease, and expiration state.",
+       "text": "Комментарий объявляет Engine владельцем mutable in-memory state, а не stateless facade."
+      },
+      {
+       "line": 51,
+       "code": "mu          sync.Mutex",
+       "text": "mu — единая блокировка для всех следующих fields."
+      },
+      {
+       "line": 53,
+       "code": "leases      map[string]*Lease",
+       "text": "leases map нельзя читать/писать из нескольких goroutine без lock."
+      },
+      {
+       "line": 54,
+       "code": "expirations expirationHeap",
+       "text": "expirationHeap меняет slice ordering; concurrent Push/Pop без lock corrupts heap invariants."
+      },
+      {
+       "line": 57,
+       "code": "recoveryErr error",
+       "text": "recoveryErr тоже находится под тем же serialization, чтобы операции не прошли через частично failed startup."
+      }
+     ]
+    },
+    {
+     "file": "internal/core/engine.go",
+     "start": 162,
+     "end": 180,
+     "sha256": "7fd2e9b9f0757d9b0fa89182214ed74a293801f93e79e7f0c26ea14bf9634551",
+     "first": "// Fetch leases one ready task for the provided timeout.",
+     "last": "}",
+     "why": "Fetch показывает применение mutex вокруг validation, recovery check и backend Acquire.",
+     "notes": [
+      {
+       "line": 164,
+       "code": "e.mu.Lock()",
+       "text": "Lock берётся в начале Fetch до обращения к shared backend and lease state."
+      },
+      {
+       "line": 165,
+       "code": "defer e.mu.Unlock()",
+       "text": "defer Unlock удерживает critical section до окончания всех state mutations в Fetch."
+      },
+      {
+       "line": 170,
+       "code": "if err := e.ensureRecovered(); err != nil {",
+       "text": "Recovery gate проверяется под lock, поэтому новые операции не идут параллельно с failed reconciliation state."
+      },
+      {
+       "line": 174,
+       "code": "task, err := e.ready.Acquire()",
+       "text": "Backend Acquire вызывается внутри lock, serializing queue transition with in-memory lease publication that follows."
+      },
+      {
+       "line": 175,
+       "code": "if err != nil {",
+       "text": "Ошибки backend обрывают operation до создания partial lease entries."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Expiration heap",
+   "walk": "После успешного Fetch Engine публикует lease и кладёт deadline в heap. ReapExpired не сканирует всю map leases; он смотрит только на earliest heap item и выходит, как только этот deadline ещё в будущем. Pop удаляет due item, а map lookup and deadline check отбрасывают stale heap entries от уже acked или rescheduled leases.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 206,
+     "end": 212,
+     "sha256": "00f5f916ba55dbef4769aefee1585bfb4125ef64d952211b02922882fe52ab53",
+     "first": "e.leases[lease.LeaseID] = lease",
+     "last": "return cloneLease(lease), nil",
+     "why": "Эти строки показывают push lease deadline into expiration heap immediately after durable fetch record.",
+     "notes": [
+      {
+       "line": 206,
+       "code": "e.leases[lease.LeaseID] = lease",
+       "text": "Lease становится visible in-memory только после successful WAL record."
+      },
+      {
+       "line": 207,
+       "code": "heap.Push(&e.expirations, expirationItem{",
+       "text": "heap.Push добавляет deadline в priority queue; reaper потом не должен сканировать все leases."
+      },
+      {
+       "line": 208,
+       "code": "LeaseID:   lease.LeaseID,",
+       "text": "LeaseID связывает heap item с map entry, чтобы pop мог проверить актуальность."
+      },
+      {
+       "line": 209,
+       "code": "ExpiresAt: lease.ExpiresAt,",
+       "text": "ExpiresAt — key ordering value: heap keeps earliest deadline at front."
+      }
+     ]
+    },
+    {
+     "file": "internal/core/engine.go",
+     "start": 250,
+     "end": 275,
+     "sha256": "f2eaf6f56c96797e880e41d4d6e5851068f5f417ac109a36c2ce79f54d38dcc3",
+     "first": "requeued := 0",
+     "last": "requeued++",
+     "why": "ReapExpired показывает peek/pop pattern: обрабатывается только earliest due deadline, а не полный scan leases.",
+     "notes": [
+      {
+       "line": 251,
+       "code": "for {",
+       "text": "Loop repeatedly consumes due heap items until front deadline is in the future."
+      },
+      {
+       "line": 252,
+       "code": "item, ok := e.expirations.peek()",
+       "text": "peek смотрит только earliest item; это и есть выигрыш heap over scanning every lease."
+      },
+      {
+       "line": 253,
+       "code": "if !ok || item.ExpiresAt.After(now) {",
+       "text": "Если earliest deadline ещё не наступил, остальные точно не раньше, поэтому loop безопасно breaks."
+      },
+      {
+       "line": 257,
+       "code": "heap.Pop(&e.expirations)",
+       "text": "heap.Pop удаляет due item before processing, сохраняя heap order for next deadline."
+      },
+      {
+       "line": 258,
+       "code": "lease, ok := e.leases[item.LeaseID]",
+       "text": "Lookup in leases map отбрасывает stale heap item, например после Ack."
+      },
+      {
+       "line": 262,
+       "code": "if lease.ExpiresAt.After(now) {",
+       "text": "Повторная проверка ExpiresAt защищает от stale older heap item after reschedule."
+      },
+      {
+       "line": 266,
+       "code": "err := e.expireLease(lease)",
+       "text": "Только актуальная expired lease передаётся в expireLease for requeue/dead-letter."
+      },
+      {
+       "line": 268,
+       "code": "heap.Push(&e.expirations, expirationItem{",
+       "text": "Если backend requeue fails, deadline retry тоже идёт через heap, а не через busy scan."
+      },
+      {
+       "line": 274,
+       "code": "delete(e.leases, item.LeaseID)",
+       "text": "После successful expiry lease удаляется из active map; stale heap entries later will be ignored."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Reaper ticker",
+   "walk": "Reaper создаёт time.Ticker и ждёт либо cancellation, либо очередной tick. На каждом tick он передаёт текущее время в target.ReapExpired, а вся логика requeue/dead-letter остаётся внутри Engine. Поэтому без этого маленького loop expired leases не двигаются сами по себе.",
+   "snippets": [
+    {
+     "file": "internal/reaper/reaper.go",
+     "start": 14,
+     "end": 29,
+     "sha256": "08bd45c8f043203be1799a5b2a08492f61aac86f02ddb2ce6143c97cd4a1e0a9",
+     "first": "// Run periodically reaps expired leases until the context is canceled.",
+     "last": "}",
+     "why": "Run — это actual scheduling loop, который регулярно вызывает Engine.ReapExpired.",
+     "notes": [
+      {
+       "line": 15,
+       "code": "func Run(ctx context.Context, target Target, interval time.Duration) {",
+       "text": "Run получает target interface, поэтому ticker не знает детали Engine, но запускает expiry processing."
+      },
+      {
+       "line": 16,
+       "code": "ticker := time.NewTicker(interval)",
+       "text": "time.NewTicker задаёт heartbeat; без него expired lease останется processing until external call."
+      },
+      {
+       "line": 17,
+       "code": "defer ticker.Stop()",
+       "text": "Stop освобождает ticker resources при выходе loop."
+      },
+      {
+       "line": 21,
+       "code": "case <-ctx.Done():",
+       "text": "Context cancellation — единственный штатный stop signal для фонового reaper."
+      },
+      {
+       "line": 23,
+       "code": "case now := <-ticker.C:",
+       "text": "Tick приносит конкретный now, который Engine сравнит с ExpiresAt."
+      },
+      {
+       "line": 24,
+       "code": "if _, err := target.ReapExpired(now); err != nil {",
+       "text": "ReapExpired — load-bearing call, который фактически requeues или dead-letters expired work."
+      },
+      {
+       "line": 25,
+       "code": "slog.Error(\"reap expired leases\", \"err\", err)",
+       "text": "Ошибка не убивает loop; следующий tick даст backend ещё один шанс."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "RESP2 framing",
+   "walk": "RESP Value хранит type byte, который соответствует первому символу RESP2 frame. Server оборачивает TCP connection в resp.Reader и resp.Writer, читает каждый frame как Value и отдаёт его adapter'у. Ответ adapter'а снова записывается как RESP, поэтому обычный Redis client видит корректные arrays, bulk strings, errors and simple strings.",
+   "snippets": [
+    {
+     "file": "internal/resp/value.go",
+     "start": 3,
+     "end": 21,
+     "sha256": "c2599326aab8ef1dfa2f28d15fab83812a03938ee0db7cef04c36ddafba5749a",
+     "first": "// Type identifies one RESP2 value kind.",
+     "last": "}",
+     "why": "Value and Type constants задают byte-level RESP2 vocabulary, который reader/writer используют для framing.",
+     "notes": [
+      {
+       "line": 3,
+       "code": "// Type identifies one RESP2 value kind.",
+       "text": "Type — это один RESP2 prefix byte, не строковое имя команды."
+      },
+      {
+       "line": 7,
+       "code": "TypeSimpleString Type = '+'",
+       "text": "+ maps to simple string replies like PONG or OK."
+      },
+      {
+       "line": 8,
+       "code": "TypeError        Type = '-'",
+       "text": "- maps to RESP error frames, которые Redis clients умеют понимать."
+      },
+      {
+       "line": 10,
+       "code": "TypeBulkString   Type = '$'",
+       "text": "$ bulk string используется для command parts and payload bytes."
+      },
+      {
+       "line": 11,
+       "code": "TypeArray        Type = '*'",
+       "text": "* array wraps Redis-style command argv and structured responses."
+      },
+      {
+       "line": 15,
+       "code": "type Value struct {",
+       "text": "Value — normalized in-memory representation после разбора bytes."
+      },
+      {
+       "line": 19,
+       "code": "Array   []Value",
+       "text": "Array stores nested RESP values, поэтому команда MOXY.FETCH приходит как array of bulk strings."
+      }
+     ]
+    },
+    {
+     "file": "internal/server/server.go",
+     "start": 83,
+     "end": 106,
+     "sha256": "8dc23e313bee57f1fc0041ff7ced1c68a7b3bac78eb4e46eb0943c5a7f261cb8",
+     "first": "func (s *Server) handleConn(conn net.Conn) {",
+     "last": "}",
+     "why": "handleConn показывает, где TCP bytes превращаются в RESP values and back for every client command.",
+     "notes": [
+      {
+       "line": 86,
+       "code": "reader := resp.NewReader(conn)",
+       "text": "resp.NewReader читает framed RESP2 из socket, а не newline-delimited text."
+      },
+      {
+       "line": 87,
+       "code": "writer := resp.NewWriter(conn)",
+       "text": "resp.NewWriter гарантирует, что replies выходят в том же Redis-shaped protocol."
+      },
+      {
+       "line": 88,
+       "code": "adapter := protocol.NewAdapter(s.handler)",
+       "text": "Adapter отделяет protocol framing от command semantics."
+      },
+      {
+       "line": 91,
+       "code": "value, err := reader.ReadValue()",
+       "text": "ReadValue consumes one full RESP value, including arrays and bulk string lengths."
+      },
+      {
+       "line": 96,
+       "code": "if writeErr := writer.WriteValue(resp.Error(\"ERR \" + err.Error())); writeErr != nil {",
+       "text": "Malformed input возвращается клиенту как RESP Error before connection closes."
+      },
+      {
+       "line": 102,
+       "code": "if err := writer.WriteValue(adapter.Handle(value)); err != nil {",
+       "text": "Adapter response serializes back through writer, so clients receive valid RESP frames."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Lease as a claim with a deadline",
+   "walk": "Fetch создаёт Lease object для task, которую backend уже moved into processing. LeaseID — это claim token для Ack, CreatedAt фиксирует момент выдачи, а ExpiresAt задаёт deadline. Reaper потом использует этот deadline, чтобы понять, когда unacked claim больше не должен удерживать processing task.",
+   "snippets": [
+    {
+     "file": "internal/core/lease.go",
+     "start": 5,
+     "end": 11,
+     "sha256": "c61cd1cdb963664dec17ac2a3f8e4252a6e556b98a12429ea323010d7f3927f4",
+     "first": "// Lease represents temporary ownership of a task by a worker.",
+     "last": "}",
+     "why": "Lease struct показывает данные, из которых состоит временное право worker'а на task.",
+     "notes": [
+      {
+       "line": 5,
+       "code": "// Lease represents temporary ownership of a task by a worker.",
+       "text": "Комментарий определяет lease как temporary ownership, а не permanent completion."
+      },
+      {
+       "line": 7,
+       "code": "LeaseID   string",
+       "text": "LeaseID — token, которым client потом подтверждает Ack."
+      },
+      {
+       "line": 8,
+       "code": "Task      Task",
+       "text": "Task остаётся attached to lease, чтобы expiry/requeue знали, какую backend task трогать."
+      },
+      {
+       "line": 9,
+       "code": "ExpiresAt time.Time",
+       "text": "ExpiresAt — deadline claim; после него reaper может вернуть task."
+      },
+      {
+       "line": 10,
+       "code": "CreatedAt time.Time",
+       "text": "CreatedAt нужен для durable record/recovery context and tests around original lease timing."
+      }
+     ]
+    },
+    {
+     "file": "internal/core/engine.go",
+     "start": 182,
+     "end": 188,
+     "sha256": "0190cb30fa4d25510bb9f13407143c9f878d0c866a7fbff10032dda033003cd8",
+     "first": "now := time.Now()",
+     "last": "}",
+     "why": "Fetch construction показывает, как timeout превращается в конкретный ExpiresAt на lease.",
+     "notes": [
+      {
+       "line": 182,
+       "code": "now := time.Now()",
+       "text": "now фиксирует issuance time для CreatedAt and ExpiresAt calculation."
+      },
+      {
+       "line": 183,
+       "code": "lease := &Lease{",
+       "text": "Lease object создаётся после backend Acquire, то есть claim соответствует processing task."
+      },
+      {
+       "line": 184,
+       "code": "LeaseID:   uuid.NewString(),",
+       "text": "Новый LeaseID отделяет claim от task id, позволяя переиздавать task с новой lease позже."
+      },
+      {
+       "line": 185,
+       "code": "Task:      task,",
+       "text": "Task из backend move встраивается в lease, чтобы Ack/ReapExpired знали task ID."
+      },
+      {
+       "line": 186,
+       "code": "CreatedAt: now,",
+       "text": "CreatedAt сохраняет original start of claim."
+      },
+      {
+       "line": 187,
+       "code": "ExpiresAt: now.Add(timeout),",
+       "text": "ExpiresAt = now plus requested timeout; это moment, после которого claim can expire."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Recovery keeps the original deadline",
+   "walk": "Recovery сворачивает WAL в live fetch records и для каждого recreates Lease. Оно копирует CreatedAt and ExpiresAt из WAL record, затем кладёт тот же deadline в expiration heap. Если бы здесь вычислялся fresh timeout, task получила бы второе visibility window после restart и могла бы оставаться invisible почти вдвое дольше.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 101,
+     "end": 122,
+     "sha256": "ce853be5607515f9cac7c42391ff47f289450483b57d7ad1721a84223f03cc52",
+     "first": "// restore rebuilds lease state from a journal replay. A lease the journal still",
+     "last": "})",
+     "why": "restore показывает строку, где recovered lease получает record.ExpiresAt instead of a fresh deadline.",
+     "notes": [
+      {
+       "line": 101,
+       "code": "// restore rebuilds lease state from a journal replay. A lease the journal still",
+       "text": "Комментарий задаёт recovery rule: open lease reinstated with original expiry."
+      },
+      {
+       "line": 103,
+       "code": "// while the process was down is reaped on the next pass instead of being handed",
+       "text": "Если lease уже lapsed while process was down, следующий reap должен увидеть это сразу."
+      },
+      {
+       "line": 108,
+       "code": "live := wal.Live(records)",
+       "text": "wal.Live выбирает только leases, которые WAL ещё считает open."
+      },
+      {
+       "line": 111,
+       "code": "lease := &Lease{",
+       "text": "Новый in-memory Lease строится from recovered record, not from current time."
+      },
+      {
+       "line": 114,
+       "code": "CreatedAt: record.CreatedAt,",
+       "text": "CreatedAt сохраняет original issue time for consistency."
+      },
+      {
+       "line": 115,
+       "code": "ExpiresAt: record.ExpiresAt,",
+       "text": "ExpiresAt берётся из record.ExpiresAt; fresh timeout здесь стоил бы worker'ам второго окна невидимости после crash."
+      },
+      {
+       "line": 119,
+       "code": "heap.Push(&e.expirations, expirationItem{",
+       "text": "Recovered deadline сразу возвращается в heap, чтобы reaper обслужил original expiry."
+      },
+      {
+       "line": 121,
+       "code": "ExpiresAt: lease.ExpiresAt,",
+       "text": "Heap item uses lease.ExpiresAt, already copied from WAL, not now.Add(timeout)."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "At-least-once, not exactly-once",
+   "walk": "Когда lease истекает без Ack, Engine либо requeues task, либо dead-letters it, и оба варианта закрывают lease record. Это защищает от loss, но не от duplicate side effects: worker A мог продолжать работу после deadline, пока worker B later receives requeued task. Ack path показывает противоположную tradeoff после backend completion: он не resurrects completed work even if ack WAL record is missing.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 281,
+     "end": 299,
+     "sha256": "739d188d33e16873866490f3a90e1e067e32d4ae782b1c8159f0fb8ace187f58",
+     "first": "func (e *Engine) expireLease(lease *Lease) error {",
+     "last": "}",
+     "why": "expireLease — место, где просроченная claim становится повторной доставкой или dead-letter, а не exactly-once guarantee.",
+     "notes": [
+      {
+       "line": 281,
+       "code": "func (e *Engine) expireLease(lease *Lease) error {",
+       "text": "expireLease вызывается reaper'ом после deadline; active worker может всё ещё выполнять side effect."
+      },
+      {
+       "line": 284,
+       "code": "if e.shouldDeadLetter(lease) {",
+       "text": "MaxAttempts выбирает между retry and dead-letter, но не доказывает, что original worker stopped."
+      },
+      {
+       "line": 286,
+       "code": "err = e.ready.DeadLetter(lease.Task.ID, \"max attempts exceeded\")",
+       "text": "DeadLetter завершает retry loop for poison work."
+      },
+      {
+       "line": 288,
+       "code": "err = e.ready.Requeue(lease.Task.ID)",
+       "text": "Requeue делает task снова ready, поэтому at-least-once допускает повторную доставку."
+      },
+      {
+       "line": 291,
+       "code": "// A task the backend no longer holds was already resolved — most often an",
+       "text": "Комментарий описывает stale lease after backend already resolved, важный для crash windows around Ack."
+      },
+      {
+       "line": 294,
+       "code": "if err != nil && !errors.Is(err, queue.ErrTaskNotProcessing) {",
+       "text": "ErrTaskNotProcessing не requeues task: completed backend state wins, чтобы не воскресить acked work."
+      },
+      {
+       "line": 298,
+       "code": "return e.record(wal.Record{Op: op, LeaseID: lease.LeaseID})",
+       "text": "Closing WAL record фиксирует, что lease больше не active after expiry/dead-letter/reconciled stale completion."
+      }
+     ]
+    },
+    {
+     "file": "internal/core/engine.go",
+     "start": 215,
+     "end": 239,
+     "sha256": "eb965890d0e32876eb54583781389ffa753d45cd79f295485dbb138ad9e96f9a",
+     "first": "// Ack permanently removes an active lease from the authoritative lease map.",
+     "last": "return nil",
+     "why": "Ack показывает backend-before-journal ordering, opposite tradeoff from Fetch: completion wins over resurrecting work.",
+     "notes": [
+      {
+       "line": 223,
+       "code": "lease, ok := e.leases[leaseID]",
+       "text": "Ack starts from an active in-memory lease; без неё client не может complete task."
+      },
+      {
+       "line": 228,
+       "code": "if err := e.ready.Complete(lease.Task.ID); err != nil {",
+       "text": "Complete hits backend first, removing task from processing before wal.OpAck is recorded."
+      },
+      {
+       "line": 231,
+       "code": "// Journal after the backend, not before. A crash in this gap leaves the",
+       "text": "Комментарий прямо говорит «Journal after the backend, not before»: это обратный tradeoff относительно Fetch ordering."
+      },
+      {
+       "line": 233,
+       "code": "// requeue it, the backend reports it is no longer processing, and the engine",
+       "text": "Если crash случился в gap, reaper позже увидит backend ErrTaskNotProcessing and drops stale lease."
+      },
+      {
+       "line": 234,
+       "code": "// drops it. Writing the journal first would strand the task instead.",
+       "text": "Writing journal first would strand the task: WAL closed lease, but backend still had processing work with no future requeue."
+      },
+      {
+       "line": 235,
+       "code": "if err := e.record(wal.Record{Op: wal.OpAck, LeaseID: leaseID}); err != nil {",
+       "text": "wal.OpAck записывается только после backend Complete, поэтому recovery may temporarily restore stale lease if record missing."
+      },
+      {
+       "line": 238,
+       "code": "delete(e.leases, leaseID)",
+       "text": "In-memory lease удаляется last, after backend completion and journal close have both succeeded."
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "title": "Attempts and dead-lettering",
+   "walk": "Attempts живёт на task и показывает, сколько раз она уже возвращалась из processing. ReapExpired asks shouldDeadLetter before backend transition: если следующий retry достигнет MaxAttempts, task идёт в dead storage, иначе Requeue возвращает её в ready. Redis script increments attempts before LPUSH, поэтому повторная доставка несёт обновлённый counter.",
+   "snippets": [
+    {
+     "file": "internal/core/engine.go",
+     "start": 281,
+     "end": 303,
+     "sha256": "9192e4e772293e1cf9d1e6dbd84ca81e862c9e2d8246299f4a665aae6785b87a",
+     "first": "func (e *Engine) expireLease(lease *Lease) error {",
+     "last": "}",
+     "why": "Engine decides whether an expired lease should retry or leave the retry loop as dead-letter.",
+     "notes": [
+      {
+       "line": 284,
+       "code": "if e.shouldDeadLetter(lease) {",
+       "text": "shouldDeadLetter проверяется до backend move, чтобы выбрать окончательный destination for expired task."
+      },
+      {
+       "line": 286,
+       "code": "err = e.ready.DeadLetter(lease.Task.ID, \"max attempts exceeded\")",
+       "text": "DeadLetter sends task to dead storage with reason when retry budget is exhausted."
+      },
+      {
+       "line": 288,
+       "code": "err = e.ready.Requeue(lease.Task.ID)",
+       "text": "Requeue is the normal retry path back to ready storage."
+      },
+      {
+       "line": 298,
+       "code": "return e.record(wal.Record{Op: op, LeaseID: lease.LeaseID})",
+       "text": "WAL close record follows backend transition, so recovered leases do not repeat already closed expiry."
+      },
+      {
+       "line": 301,
+       "code": "func (e *Engine) shouldDeadLetter(lease *Lease) bool {",
+       "text": "shouldDeadLetter isolates retry-budget rule in one helper."
+      },
+      {
+       "line": 302,
+       "code": "return e.config.MaxAttempts > 0 && lease.Task.Attempts+1 >= e.config.MaxAttempts",
+       "text": "Attempts+1 compares the next backend retry/dead-letter increment against MaxAttempts, preventing one extra delivery."
+      }
+     ]
+    },
+    {
+     "file": "internal/queue/redis_scripts.go",
+     "start": 58,
+     "end": 72,
+     "sha256": "cef9ab5b312ebf4e7b9f7bd98ef98f1aaf274d770067a3890cb978e2173ea7f5",
+     "first": "const requeueTaskScript = `",
+     "last": "return 1",
+     "why": "Redis Requeue script shows the attempt increment happening in the same atomic move back to ready.",
+     "notes": [
+      {
+       "line": 63,
+       "code": "local encoded = redis.call(\"HGET\", processing, id)",
+       "text": "HGET fetches the exact processing task by id before retrying it."
+      },
+      {
+       "line": 68,
+       "code": "redis.call(\"HDEL\", processing, id)",
+       "text": "HDEL removes the task from processing so it cannot remain leased and ready at once."
+      },
+      {
+       "line": 69,
+       "code": "local task = cjson.decode(encoded)",
+       "text": "Decode lets Lua mutate Attempts inside the JSON payload."
+      },
+      {
+       "line": 70,
+       "code": "task[\"attempts\"] = (task[\"attempts\"] or 0) + 1",
+       "text": "Attempts increments before LPUSH, so the next worker receives the updated retry count."
+      },
+      {
+       "line": 71,
+       "code": "redis.call(\"LPUSH\", ready, cjson.encode(task))",
+       "text": "LPUSH returns the incremented task to ready storage as one Lua-side transition."
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "doc_anchors": [
+  {
+   "ref": "internal/queue/redis.go:61",
+   "code": "}"
+  },
+  {
+   "ref": "internal/queue/redis_scripts.go:38",
+   "code": "local encoded = redis.call(\"RPOP\", ready)"
+  },
+  {
+   "ref": "internal/queue/redis.go:41",
+   "code": "}"
+  },
+  {
+   "ref": "internal/queue/redis_scripts.go:5",
+   "code": "// Processing tasks are held in a hash keyed by task id rather than a list."
+  },
+  {
+   "ref": "internal/queue/redis.go:73",
+   "code": "// Acquire atomically moves one task from ready storage into the processing hash."
+  },
+  {
+   "ref": "internal/queue/redis_scripts.go:44",
+   "code": "redis.call(\"HSET\", processing, task[\"id\"], encoded)"
+  },
+  {
+   "ref": "docs/adr/0001-redis-lists-vs-streams.md:20",
+   "code": "Keep the current Redis backend on plain data types for now:"
+  },
+  {
+   "ref": "internal/queue/backend.go:29",
+   "code": "// Backend is the minimal ready-queue storage boundary used by the core engine."
+  },
+  {
+   "ref": "internal/core/engine.go:174",
+   "code": "task, err := e.ready.Acquire()"
+  },
+  {
+   "ref": "internal/core/engine.go:190",
+   "code": "// Journal before the lease becomes visible. The task has already left the"
+  },
+  {
+   "ref": "internal/core/engine.go:193",
+   "code": "if err := e.record(wal.Record{"
+  },
+  {
+   "ref": "docs/failure-matrix.md:45",
+   "code": "| F1: after backend `Acquire`, before any fetch WAL bytes are durable | Returned to ready by startup processing reconciliation; no recovered active lease is created because no fetch record survived. | No. | No from the crashed fetch because no lease was published; a later fetch can deliver it once. | Startup `RecoverOrphanedProcessing` reconciles backend processing entries not covered by recovered leases. | At-least-once for the task; no retry attempt is charged during reconciliation. | `TestFetchCrashBoundaryAfterBackendAcquireBeforeJournalRequeuesOrphan` |"
+  },
+  {
+   "ref": "docs/failure-matrix.md:46",
+   "code": "| F2: crash during fetch WAL write, leaving a torn final fetch record | Earlier intact WAL records recover with their original deadlines. The torn fetch record is discarded and truncated; its processing task has no recovered lease and is returned to ready. | No. | No for the torn task from the crashed fetch. Earlier recovered leases can be redelivered after their original deadline. | WAL truncates the torn tail; startup `RecoverOrphanedProcessing` reconciles the processing task whose fetch record was torn. | At-least-once for the torn task; earlier intact leases remain at-least-once with original deadlines. | `TestTornFinalFetchRecordIsDroppedAndOrphanedTaskIsRequeued` |"
+  },
+  {
+   "ref": "internal/core/engine.go:94",
+   "code": "activeTaskIDs := engine.restore(config.Recovered)"
+  },
+  {
+   "ref": "internal/queue/backend.go:36",
+   "code": "// RecoverOrphanedProcessing moves processing tasks that are not covered by"
+  },
+  {
+   "ref": "internal/queue/redis.go:134",
+   "code": "}"
+  },
+  {
+   "ref": "internal/wal/wal.go:61",
+   "code": "// Options controls durability."
+  },
+  {
+   "ref": "internal/wal/wal.go:130",
+   "code": "if _, err := l.file.Write(frame); err != nil {"
+  },
+  {
+   "ref": "internal/wal/wal.go:133",
+   "code": "if l.sync {"
+  },
+  {
+   "ref": "internal/wal/wal.go:10",
+   "code": "// Records are framed as:"
+  },
+  {
+   "ref": "internal/wal/wal.go:252",
+   "code": "binary.LittleEndian.PutUint32(frame[:4], uint32(len(payload)))"
+  },
+  {
+   "ref": "internal/wal/wal.go:253",
+   "code": "binary.LittleEndian.PutUint32(frame[4:headerSize], crc32.ChecksumIEEE(payload))"
+  },
+  {
+   "ref": "internal/wal/wal.go:96",
+   "code": "records, good, err := replay(file)"
+  },
+  {
+   "ref": "internal/wal/wal.go:101",
+   "code": "if err := file.Truncate(good); err != nil {"
+  },
+  {
+   "ref": "internal/wal/wal.go:258",
+   "code": "// replay reads every intact record and reports the offset just past the last"
+  },
+  {
+   "ref": "internal/wal/wal.go:147",
+   "code": "// Compact rewrites the journal with one fetch record per still-open lease,"
+  },
+  {
+   "ref": "internal/wal/wal.go:164",
+   "code": "temporary := l.path + \".compact\""
+  },
+  {
+   "ref": "internal/wal/wal.go:201",
+   "code": "if err := os.Rename(temporary, l.path); err != nil {"
+  },
+  {
+   "ref": "internal/core/engine.go:49",
+   "code": "// Engine owns all mutable in-memory queue, lease, and expiration state."
+  },
+  {
+   "ref": "internal/core/engine.go:164",
+   "code": "e.mu.Lock()"
+  },
+  {
+   "ref": "internal/core/heap.go:10",
+   "code": "type expirationHeap []expirationItem"
+  },
+  {
+   "ref": "internal/core/engine.go:207",
+   "code": "heap.Push(&e.expirations, expirationItem{"
+  },
+  {
+   "ref": "internal/core/engine.go:251",
+   "code": "for {"
+  },
+  {
+   "ref": "internal/reaper/reaper.go:16",
+   "code": "ticker := time.NewTicker(interval)"
+  },
+  {
+   "ref": "internal/reaper/reaper.go:23",
+   "code": "case now := <-ticker.C:"
+  },
+  {
+   "ref": "internal/resp/value.go:3",
+   "code": "// Type identifies one RESP2 value kind."
+  },
+  {
+   "ref": "internal/server/server.go:86",
+   "code": "reader := resp.NewReader(conn)"
+  },
+  {
+   "ref": "internal/core/lease.go:5",
+   "code": "// Lease represents temporary ownership of a task by a worker."
+  },
+  {
+   "ref": "internal/core/engine.go:187",
+   "code": "ExpiresAt: now.Add(timeout),"
+  },
+  {
+   "ref": "internal/core/engine.go:101",
+   "code": "// restore rebuilds lease state from a journal replay. A lease the journal still"
+  },
+  {
+   "ref": "internal/core/engine.go:111",
+   "code": "lease := &Lease{"
+  },
+  {
+   "ref": "docs/failure-matrix.md:6",
+   "code": "exactly-once delivery. The durable queue backend is authoritative for task"
+  },
+  {
+   "ref": "internal/core/engine.go:281",
+   "code": "func (e *Engine) expireLease(lease *Lease) error {"
+  },
+  {
+   "ref": "docs/failure-matrix.md:48",
+   "code": "| F4: after fsync, before in-memory lease publication | Backend processing plus durable fetch WAL record. Restart restores one active lease and one expiration heap entry with the original deadline. | No. | Yes after the original deadline if work is retried or the original worker resumes. | Recovery restores; reaper redelivers only after the preserved deadline. | At-least-once, not at-most-once. | `TestFetchCrashBoundaryAfterFsyncBeforeMemoryPublishRestoresOriginalDeadline` |"
+  },
+  {
+   "ref": "docs/failure-matrix.md:50",
+   "code": "| F6: after the fetch reply reaches the client | Same durable state as F5. The client may ack before expiry after restart; otherwise the reaper requeues after the original deadline. | No, assuming the fetch record was fsynced. | Yes if the original client continues past the lease deadline and the task is requeued. | Client ack or reaper. | At-least-once, not at-most-once. | Covered by the same durable-state tests as F5 and existing recovery tests. |"
+  },
+  {
+   "ref": "internal/task/task.go:3",
+   "code": "// Task represents a unit of work managed by Moxy."
+  },
+  {
+   "ref": "internal/core/engine.go:301",
+   "code": "func (e *Engine) shouldDeadLetter(lease *Lease) bool {"
+  },
+  {
+   "ref": "internal/queue/redis_scripts.go:68",
+   "code": "redis.call(\"HDEL\", processing, id)"
+  }
+ ]
+}
