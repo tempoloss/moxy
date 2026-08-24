@@ -50,6 +50,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: tempoloss/tempoloss
+          ref: 2010235b0926f23b06b8f7d4e6c2f3a412fe2c33
           path: .primitives-tools
 
       - name: Re-anchor what moved and re-check
