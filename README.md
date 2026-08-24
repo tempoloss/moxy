@@ -58,12 +58,12 @@ requeued after the lease expires.
 ## Lease Durability
 
 A lease is a claim: this worker holds this task until this moment. That claim
-used to live only in the engine's memory, so a restart lost it — and every task
+used to live only in the engine's memory, so a restart lost it - and every task
 already moved into processing storage was stranded, because the reaper walks the
 in-memory expiration heap and cannot expire a lease it never saw.
 
-Every transition is now journalled to an append-only file before the lease
-becomes visible, and the journal is replayed on boot:
+Every transition is now journalled to an append-only file, and the journal is
+replayed on boot:
 
 ```text
 [uint32 length][uint32 CRC32][payload]
@@ -84,14 +84,15 @@ Write ordering differs per operation, and the asymmetry is deliberate:
 
 | Operation | Order | Why |
 | --- | --- | --- |
-| Fetch | journal, then publish the lease | The task has already left ready storage; a failed write hands it back rather than leaving it held by nobody |
-| Ack | backend, then journal | A crash in the gap leaves a lease the next reap resolves — the backend reports the task is no longer processing and the engine releases it. The reverse order would strand the task |
+| Fetch | generate lease ID, backend acquire with that lease ID, then journal before publishing the lease | The task has already left ready storage under a generation fence; a failed write hands that exact claim back rather than leaving it held by nobody |
+| Ack | backend, then journal | A crash in the gap leaves a stale lease the next recovery, retry, or reap closes with `wal.OpStale`. The reverse order redelivers finished work: recovery folds the lease closed, startup reconciliation returns the still-processing task to ready, and no attempt is charged to bound it |
 
 **What this does not cover.** The backend owns ready-queue durability, so a
-Redis configured to lose writes still loses tasks. And a task acquired in the
-moment before its journal write lands is not recovered; it stays in processing
-storage until an operator moves it. Closing that window needs a reconciliation
-pass over processing storage at boot, which is on the roadmap.
+Redis configured to lose writes still loses tasks. An append that has been
+written but not yet fsynced promises nothing: recovery may see the record, a
+torn record, or none, and only the surviving-record branch restores the original
+deadline. And the guarantee is at-least-once, so a worker that runs past its
+deadline can be joined by a second one holding the requeued task.
 
 The WAL mechanism is implemented in `internal/wal` and exercised by
 `internal/wal/wal_test.go` tests such as `TestRecordsSurviveReopen`,
@@ -108,19 +109,20 @@ delivered twice, who reconciles it, and which test proves it.
 Read it before relying on Moxy for anything. The window that used to be its named
 weakness is now closed: a crash after the backend acquire but before any fetch
 WAL bytes are durable (`F1`, and the torn-record case `F2`) left the task in
-backend `processing` with no recovered lease, so nothing reaped it. Startup
-recovery now reconciles the backend against the leases the journal restored: a
-processing task with no recovered lease cannot be held by anyone, because its
-holder died with the process, so it returns to `ready` without being charged an
-attempt. `RecoverOrphanedProcessing` does the move atomically inside each
-backend, including a Lua script for Redis.
+backend `processing` with no recovered task-plus-lease fence, so nothing reaped
+it. Startup recovery now reconciles the backend against the task and lease IDs
+the journal restored: a processing task without an exact recovered fence cannot
+be held by anyone in the new process, so it returns to `ready` without being
+charged an attempt. `RecoverOrphanedProcessing` does the move atomically inside
+each backend, including a Lua script for Redis.
 
 The guarantee across those windows is at-least-once, not exactly-once: a task can
 be delivered twice if a recovered lease passes its preserved deadline while work
 continues elsewhere. Reconciliation runs only during recovery, never
 periodically, so it cannot requeue a task a live worker still holds under a valid
-lease — `internal/core/crash_matrix_test.go` asserts both that and that a durably
-acknowledged task is never resurrected.
+task-plus-lease fence. `internal/core/crash_matrix_test.go` and
+`internal/core/recovery_test.go` cover recovered lease and stale-generation
+boundaries.
 
 ## Limitations / Not Yet Proven
 
@@ -152,7 +154,7 @@ The tape writes `docs/assets/recovery.gif`.
 
 - In-memory queue backend with `READY` and `PROCESSING` storage.
 - Redis queue backend using `go-redis/v9`.
-- Atomic Redis `Complete` and `Requeue` operations with Lua scripts.
+- Atomic Redis `Complete`, `Requeue`, and `DeadLetter` operations with lease-fenced Lua scripts.
 - Single-queue lease coordinator in `internal/core`.
 - Multi-queue service layer in `internal/service`.
 - Protocol-neutral command handler in `internal/command`.
@@ -243,17 +245,20 @@ It is deterministic, easy to test, and useful for validating lease behavior.
 
 ### RedisQueue
 
-`RedisQueue` keeps what is waiting in a list and what is claimed in a hash:
+`RedisQueue` keeps what is waiting in a list, what is claimed in one hash, and
+the lease generation fence in a second hash:
 
-- `moxy:{queue}:ready` — list; tasks are taken with `RPOP` and returned with `LPUSH`
-- `moxy:{queue}:processing` — hash keyed by task id
-- `moxy:{queue}:dead` — list
+- `moxy:{queue}:ready` - list; tasks are taken with `RPOP` and returned with `LPUSH`
+- `moxy:{queue}:processing` - hash keyed by task id, storing the serialized task
+- `moxy:{queue}:processing:leases` - hash keyed by task id, storing the current lease id
+- `moxy:{queue}:dead` - list
 
-`Acquire` runs one Lua script that does `RPOP` off the ready list and `HSET` into
-the processing hash, so no crash can land between the two. `Complete`, `Requeue`
-and startup reclamation are Lua scripts as well, and they address a task by id in
-the hash rather than scanning a list — which is the reason processing is a hash
-and not a second list. `LMOVE` would fit list-to-list and is deliberately unused.
+`Acquire(leaseID)` runs one Lua script that does `RPOP` off the ready list and
+`HSET` into both processing hashes, so no crash can land between the task move
+and its fence. `Complete`, `Requeue`, `DeadLetter`, and startup reclamation are
+Lua scripts as well. They address a task by id in the hash and compare the
+stored lease ID before mutating either hash, which is the reason processing is
+not a second list. `LMOVE` would fit list-to-list and is deliberately unused.
 
 ```go
 client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
@@ -355,7 +360,8 @@ implemented yet:
 - Keep hardening the command/service boundary.
 - Add observability-friendly stats and structured errors.
 - Add transparent Redis pass-through after the Moxy command path stays boring.
-- Close the acquire-to-journal window by reconciling processing storage on boot.
+- Clear the stale lease on ack retry instead of surfacing `ErrTaskNotProcessing` and waiting for the reaper.
+- Run the engine under `go test -race`, and simulate a crash during WAL compaction.
 
 ## License
 

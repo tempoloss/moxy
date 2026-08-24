@@ -21,24 +21,29 @@ Keep the current Redis backend on plain data types for now:
 
 - Ready tasks live in a Redis list, taken with `RPOP` and returned with `LPUSH`.
 - Processing tasks live in a **hash keyed by task id**, not a list.
+- Processing lease fences live in `moxy:{queue}:processing:leases`, another hash
+  keyed by task id.
 - One Lua script performs the ready-to-processing transition: `RPOP` off the list
-  and `HSET` into the hash, so a crash cannot land between them.
+  and `HSET` into both processing hashes, so a crash cannot land between the task
+  move and its generation fence.
 - Further Lua scripts perform bounded atomic transitions for ACK, requeue,
-  dead-letter moves, and startup reclamation of orphaned processing entries.
+  dead-letter moves, and startup reclamation. They compare the stored lease ID
+  before mutating processing state.
 
 Processing is a hash rather than a list because every operation on an in-flight
 task addresses it by id: ACK deletes one entry, requeue moves one back, the
-reaper reclaims specific ones. On a list each of those is a scan; on a hash each
-is `HDEL`/`HGET`. `LMOVE` would be the natural primitive for list-to-list, and it
-is deliberately not used here for that reason.
+reaper reclaims specific ones. The second hash stores which lease generation owns
+that task so a stale lease cannot mutate a newer one. On a list each task lookup
+is a scan; on a hash each is `HGET`/`HDEL`. `LMOVE` would be the natural primitive
+for list-to-list, and it is deliberately not used here for that reason.
 
 ## Why Plain Data Types First
 
-A list for what is waiting and a hash for what is claimed is the simplest explicit
-baseline. It makes `READY -> PROCESSING -> ACK/REQUEUE` easy to reason about, maps
-cleanly to the current `queue.Backend` abstraction, and keeps every transition
-short enough to express as one Lua script. Nothing about the lifecycle is implied
-by the data type: it is all written down.
+A list for what is waiting and hashes for what is claimed are the simplest
+explicit baseline. They make `READY -> PROCESSING -> ACK/REQUEUE` easy to reason
+about, map cleanly to the current `queue.Backend` abstraction, and keep every
+transition short enough to express as one Lua script. Nothing about the lifecycle
+is implied by the data type: it is all written down.
 
 ## Streams Alternative
 
