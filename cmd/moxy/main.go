@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -26,6 +27,8 @@ import (
 
 var version = "dev"
 
+const defaultDaemonMaxAttempts = 3
+
 func main() {
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdout))
 }
@@ -35,9 +38,11 @@ func run(parent context.Context, args []string, stdout io.Writer) int {
 	flags.SetOutput(stdout)
 
 	addr := flags.String("addr", "127.0.0.1:6380", "TCP address to listen on")
+	maxConns := flags.Int("max-conns", 1024, "maximum concurrent client connections; 0 disables the cap")
 	backend := flags.String("backend", "memory", "queue backend: memory or redis")
 	redisAddr := flags.String("redis-addr", "localhost:6379", "Redis address for the redis backend")
 	walDir := flags.String("wal-dir", "", "directory for lease journals; empty keeps lease state in memory only")
+	maxAttempts := flags.Int("max-attempts", defaultDaemonMaxAttempts, "maximum lease expirations before dead-lettering; 0 disables the cap")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -45,6 +50,10 @@ func run(parent context.Context, args []string, stdout io.Writer) int {
 	if *showVersion {
 		fmt.Fprintln(stdout, version)
 		return 0
+	}
+	if *maxAttempts < 0 {
+		fmt.Fprintln(stdout, "max-attempts must be non-negative")
+		return 2
 	}
 
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
@@ -57,19 +66,34 @@ func run(parent context.Context, args []string, stdout io.Writer) int {
 	journals, closeJournals := buildJournalFactory(*walDir, logger)
 	defer closeJournals()
 
-	svc := service.NewWithConfig(factory, service.ServiceConfig{Journal: journals})
+	svc := service.NewWithConfig(factory, service.ServiceConfig{Engine: core.EngineConfig{MaxAttempts: *maxAttempts}, Journal: journals})
 	handler := command.NewHandler(svc)
-	srv := server.New(handler, server.Config{Addr: *addr})
+	srv := server.New(handler, server.Config{Addr: *addr, MaxConns: *maxConns})
 
 	go reaper.Run(ctx, svc, time.Second)
 
-	logger.Info("Moxy listening", "version", version, "addr", *addr, "backend", *backend, "wal_dir", *walDir)
+	if shouldWarnUnauthenticatedBind(*addr) {
+		logger.Warn("no authentication: every queue is readable and writable by anyone who reaches this port", "addr", *addr)
+	}
+
+	logger.Info("Moxy listening", "version", version, "addr", *addr, "backend", *backend, "wal_dir", *walDir, "max_attempts", *maxAttempts)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("server stopped with error", "err", err)
 		return 1
 	}
 	logger.Info("Moxy stopped")
 	return 0
+}
+
+func shouldWarnUnauthenticatedBind(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil || tcpAddr.IP == nil {
+		return false
+	}
+	return !tcpAddr.IP.IsLoopback()
 }
 
 func buildBackendFactory(ctx context.Context, logger *slog.Logger, backend, redisAddr string) (service.BackendFactory, func()) {
@@ -147,8 +171,8 @@ func buildJournalFactory(dir string, logger *slog.Logger) (service.JournalFactor
 
 // journalFileName keeps a queue name from escaping the journal directory. Names
 // arrive over the network and would otherwise become paths, so anything outside
-// a conservative set is rejected rather than rewritten into something that
-// could collide with another queue's journal.
+// a conservative set is rejected instead of rewritten into something that could
+// collide with another queue's journal.
 func journalFileName(queueName string) (string, error) {
 	if queueName == "" {
 		return "", errors.New("queue name must not be empty")

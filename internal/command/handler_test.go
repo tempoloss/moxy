@@ -102,11 +102,10 @@ func TestInvalidArgumentCountFails(t *testing.T) {
 func TestInvalidTimeoutFails(t *testing.T) {
 	handler := newTestHandler()
 
-	if _, err := handler.Handle(Command{Name: "MOXY.FETCH", Args: []string{"jobs", "not-a-number"}}); !errors.Is(err, ErrInvalidTimeout) {
-		t.Fatalf("fetch timeout parse error = %v, want ErrInvalidTimeout", err)
-	}
-	if _, err := handler.Handle(Command{Name: "MOXY.FETCH", Args: []string{"jobs", "0"}}); !errors.Is(err, core.ErrInvalidTimeout) {
-		t.Fatalf("fetch zero timeout error = %v, want core.ErrInvalidTimeout", err)
+	for _, timeout := range []string{"not-a-number", "0", "-1", "18446744073710"} {
+		if _, err := handler.Handle(Command{Name: "MOXY.FETCH", Args: []string{"jobs", timeout}}); !errors.Is(err, ErrInvalidTimeout) {
+			t.Fatalf("fetch timeout %q error = %v, want ErrInvalidTimeout", timeout, err)
+		}
 	}
 }
 

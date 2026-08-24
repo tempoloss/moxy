@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,6 +170,41 @@ func TestEmptyQueueNameFails(t *testing.T) {
 	}
 	if _, ok := service.Stats(""); ok {
 		t.Fatal("stats reported empty queue name")
+	}
+}
+
+func TestInvalidQueueNamesFail(t *testing.T) {
+	service := New(memoryBackendFactory)
+	for _, name := range []string{
+		"..",
+		"../escape",
+		"queue.with.dots",
+		"queue name",
+		strings.Repeat("a", 65),
+	} {
+		if _, err := service.Enqueue(name, []byte("payload")); !errors.Is(err, ErrInvalidQueueName) {
+			t.Fatalf("enqueue %q error = %v, want ErrInvalidQueueName", name, err)
+		}
+		if _, err := service.Fetch(name, time.Minute); !errors.Is(err, ErrInvalidQueueName) {
+			t.Fatalf("fetch %q error = %v, want ErrInvalidQueueName", name, err)
+		}
+		if _, ok := service.Stats(name); ok {
+			t.Fatalf("stats reported invalid queue name %q", name)
+		}
+	}
+}
+
+func TestMaxQueuesRefusesNewQueuesAfterCeiling(t *testing.T) {
+	service := NewWithConfig(memoryBackendFactory, ServiceConfig{MaxQueues: 1})
+	if _, err := service.Enqueue("alpha", []byte("payload")); err != nil {
+		t.Fatalf("enqueue alpha returned error: %v", err)
+	}
+
+	if _, err := service.Enqueue("beta", []byte("payload")); !errors.Is(err, ErrTooManyQueues) {
+		t.Fatalf("enqueue beta error = %v, want ErrTooManyQueues", err)
+	}
+	if _, err := service.Fetch("alpha", time.Minute); err != nil {
+		t.Fatalf("fetch alpha returned error: %v", err)
 	}
 }
 

@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -198,6 +200,67 @@ func TestServerTwoSimultaneousClients(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestServerMoxyFetchRejectsInvalidNameAndOverflowTimeout(t *testing.T) {
+	server, cancel, done := startTestServer(t)
+	defer stopTestServer(t, cancel, done)
+
+	conn := dialTestServer(t, server)
+	defer conn.Close()
+
+	invalidName := sendRESP(
+		t,
+		conn,
+		resp.Array(resp.BulkString("MOXY.FETCH"), resp.BulkString(strings.Repeat("a", 65)), resp.BulkString("1000")),
+	)
+	t.Logf("MOXY.FETCH <65-char-name> 1000 => %s", invalidName.String)
+	if invalidName.Type != resp.TypeError || invalidName.String != "ERR "+service.ErrInvalidQueueName.Error() {
+		t.Fatalf("invalid-name reply = %+v, want ErrInvalidQueueName", invalidName)
+	}
+
+	invalidTimeout := sendRESP(
+		t,
+		conn,
+		resp.Array(resp.BulkString("MOXY.FETCH"), resp.BulkString("q"), resp.BulkString("18446744073710")),
+	)
+	t.Logf("MOXY.FETCH q 18446744073710 => %s", invalidTimeout.String)
+	if invalidTimeout.Type != resp.TypeError || invalidTimeout.String != "ERR "+command.ErrInvalidTimeout.Error() {
+		t.Fatalf("invalid-timeout reply = %+v, want ErrInvalidTimeout", invalidTimeout)
+	}
+}
+
+func TestIsTemporaryAccept(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "emfile", err: syscall.EMFILE, want: true},
+		{name: "enfile", err: syscall.ENFILE, want: true},
+		{name: "timeout", err: timeoutAcceptError{}, want: true},
+		{name: "ordinary", err: errors.New("accept failed"), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTemporaryAccept(tc.err); got != tc.want {
+				t.Fatalf("isTemporaryAccept(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+type timeoutAcceptError struct{}
+
+func (timeoutAcceptError) Error() string {
+	return "accept timeout"
+}
+
+func (timeoutAcceptError) Timeout() bool {
+	return true
+}
+
+func (timeoutAcceptError) Temporary() bool {
+	return true
 }
 
 func startTestServer(t *testing.T) (*Server, context.CancelFunc, <-chan error) {

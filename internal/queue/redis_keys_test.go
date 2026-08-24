@@ -11,15 +11,19 @@ func TestRedisQueueKeysUseClusterSafeHashTag(t *testing.T) {
 	if keys.processing != "moxy:{jobs}:processing" {
 		t.Fatalf("processing key = %q, want %q", keys.processing, "moxy:{jobs}:processing")
 	}
+	if keys.processingLeases != "moxy:{jobs}:processing:leases" {
+		t.Fatalf("processing lease key = %q, want %q", keys.processingLeases, "moxy:{jobs}:processing:leases")
+	}
 	if keys.dead != "moxy:{jobs}:dead" {
 		t.Fatalf("dead key = %q, want %q", keys.dead, "moxy:{jobs}:dead")
 	}
 
 	wantTag := "{jobs}"
 	for name, key := range map[string]string{
-		"ready":      keys.ready,
-		"processing": keys.processing,
-		"dead":       keys.dead,
+		"ready":             keys.ready,
+		"processing":        keys.processing,
+		"processing_leases": keys.processingLeases,
+		"dead":              keys.dead,
 	} {
 		if got := redisHashTag(key); got != wantTag {
 			t.Fatalf("%s key hash tag = %q, want %q", name, got, wantTag)

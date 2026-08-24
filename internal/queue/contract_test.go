@@ -28,6 +28,9 @@ func RunBackendContractTests(t *testing.T, factory backendFactory) {
 	t.Run("CompleteMissingProcessingTaskFails", func(t *testing.T) {
 		testCompleteMissingProcessingTaskFails(t, factory)
 	})
+	t.Run("CompleteMismatchedLeaseFails", func(t *testing.T) {
+		testCompleteMismatchedLeaseFails(t, factory)
+	})
 	t.Run("RequeueMovesProcessingTaskBackToReady", func(t *testing.T) {
 		testRequeueMovesProcessingTaskBackToReady(t, factory)
 	})
@@ -37,6 +40,9 @@ func RunBackendContractTests(t *testing.T, factory backendFactory) {
 	t.Run("RequeueMissingProcessingTaskFails", func(t *testing.T) {
 		testRequeueMissingProcessingTaskFails(t, factory)
 	})
+	t.Run("RequeueMismatchedLeaseFails", func(t *testing.T) {
+		testRequeueMismatchedLeaseFails(t, factory)
+	})
 	t.Run("RecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease", func(t *testing.T) {
 		testRecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease(t, factory)
 	})
@@ -45,6 +51,12 @@ func RunBackendContractTests(t *testing.T, factory backendFactory) {
 	})
 	t.Run("DeadLetterMissingProcessingTaskFails", func(t *testing.T) {
 		testDeadLetterMissingProcessingTaskFails(t, factory)
+	})
+	t.Run("DeadLetterMismatchedLeaseFails", func(t *testing.T) {
+		testDeadLetterMismatchedLeaseFails(t, factory)
+	})
+	t.Run("OldLeaseCannotMutateCurrentLease", func(t *testing.T) {
+		testOldLeaseCannotMutateCurrentLease(t, factory)
 	})
 	t.Run("StatsReportsReadyAndProcessing", func(t *testing.T) {
 		testStatsReportsReadyAndProcessing(t, factory)
@@ -68,7 +80,7 @@ func testEnqueueThenAcquireReturnsTask(t *testing.T, factory backendFactory) {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
 
-	got, err := backend.Acquire()
+	got, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
@@ -86,7 +98,7 @@ func testAcquireMovesReadyToProcessing(t *testing.T, factory backendFactory) {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
 
-	got, err := backend.Acquire()
+	got, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
@@ -106,7 +118,7 @@ func testAcquireMovesReadyToProcessing(t *testing.T, factory backendFactory) {
 func testAcquireEmptyReturnsQueueEmpty(t *testing.T, factory backendFactory) {
 	backend := factory(t)
 
-	if got, err := backend.Acquire(); !errors.Is(err, ErrQueueEmpty) {
+	if got, err := backend.Acquire("lease-empty"); !errors.Is(err, ErrQueueEmpty) {
 		t.Fatalf("acquire returned task %+v and error %v, want ErrQueueEmpty", got, err)
 	}
 }
@@ -116,12 +128,12 @@ func testCompleteRemovesProcessingTask(t *testing.T, factory backendFactory) {
 	if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := backend.Complete(acquired.ID); err != nil {
+	if err := backend.Complete(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("complete returned error: %v", err)
 	}
 
@@ -137,8 +149,29 @@ func testCompleteRemovesProcessingTask(t *testing.T, factory backendFactory) {
 func testCompleteMissingProcessingTaskFails(t *testing.T, factory backendFactory) {
 	backend := factory(t)
 
-	if err := backend.Complete("missing"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := backend.Complete("missing", "lease-missing"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("complete returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
+func testCompleteMismatchedLeaseFails(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := backend.Acquire("lease-1")
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := backend.Complete(acquired.ID, "lease-2"); !errors.Is(err, ErrLeaseFenceMismatch) {
+		t.Fatalf("complete returned %v, want ErrLeaseFenceMismatch", err)
+	}
+	if got := backend.Stats(); got.Processing != 1 || got.Ready != 0 || got.Dead != 0 {
+		t.Fatalf("stats after mismatched complete = %+v, want ready=0 processing=1 dead=0", got)
+	}
+	if err := backend.Complete(acquired.ID, "lease-1"); err != nil {
+		t.Fatalf("complete with matching lease returned error: %v", err)
 	}
 }
 
@@ -147,12 +180,12 @@ func testRequeueMovesProcessingTaskBackToReady(t *testing.T, factory backendFact
 	if err := backend.Enqueue(task.Task{ID: "task-1", Payload: []byte("payload")}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := backend.Requeue(acquired.ID); err != nil {
+	if err := backend.Requeue(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("requeue returned error: %v", err)
 	}
 
@@ -164,7 +197,7 @@ func testRequeueMovesProcessingTaskBackToReady(t *testing.T, factory backendFact
 		t.Fatalf("processing count = %d, want 0", stats.Processing)
 	}
 
-	again, err := backend.Acquire()
+	again, err := backend.Acquire("lease-2")
 	if err != nil {
 		t.Fatalf("acquire after requeue returned error: %v", err)
 	}
@@ -179,8 +212,29 @@ func testRequeueMovesProcessingTaskBackToReady(t *testing.T, factory backendFact
 func testRequeueMissingProcessingTaskFails(t *testing.T, factory backendFactory) {
 	backend := factory(t)
 
-	if err := backend.Requeue("missing"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := backend.Requeue("missing", "lease-missing"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("requeue returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
+func testRequeueMismatchedLeaseFails(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := backend.Acquire("lease-1")
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := backend.Requeue(acquired.ID, "lease-2"); !errors.Is(err, ErrLeaseFenceMismatch) {
+		t.Fatalf("requeue returned %v, want ErrLeaseFenceMismatch", err)
+	}
+	if got := backend.Stats(); got.Processing != 1 || got.Ready != 0 || got.Dead != 0 {
+		t.Fatalf("stats after mismatched requeue = %+v, want ready=0 processing=1 dead=0", got)
+	}
+	if err := backend.Complete(acquired.ID, "lease-1"); err != nil {
+		t.Fatalf("complete after mismatched requeue returned error: %v", err)
 	}
 }
 
@@ -189,15 +243,15 @@ func testRequeueIncrementsAttempts(t *testing.T, factory backendFactory) {
 	if err := backend.Enqueue(task.Task{ID: "task-1", Attempts: 2}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := backend.Requeue(acquired.ID); err != nil {
+	if err := backend.Requeue(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("requeue returned error: %v", err)
 	}
-	again, err := backend.Acquire()
+	again, err := backend.Acquire("lease-2")
 	if err != nil {
 		t.Fatalf("acquire after requeue returned error: %v", err)
 	}
@@ -215,30 +269,39 @@ func testRecoverOrphanedProcessingMovesOnlyTasksWithoutActiveLease(t *testing.T,
 		t.Fatalf("enqueue orphan task returned error: %v", err)
 	}
 
-	active, err := backend.Acquire()
+	active, err := backend.Acquire("active-lease")
 	if err != nil {
 		t.Fatalf("acquire active task returned error: %v", err)
 	}
-	orphan, err := backend.Acquire()
+	orphan, err := backend.Acquire("orphan-lease")
 	if err != nil {
 		t.Fatalf("acquire orphan task returned error: %v", err)
 	}
 
-	moved, err := backend.RecoverOrphanedProcessing(map[string]struct{}{active.ID: {}})
+	result, err := backend.RecoverOrphanedProcessing([]LeaseFence{
+		{TaskID: active.ID, LeaseID: "active-lease"},
+		{TaskID: orphan.ID, LeaseID: "newer-orphan-lease"},
+	})
 	if err != nil {
 		t.Fatalf("recover orphaned processing returned error: %v", err)
 	}
-	if moved != 1 {
-		t.Fatalf("recovered orphan count = %d, want 1", moved)
+	if result.Moved != 1 {
+		t.Fatalf("recovered orphan count = %d, want 1", result.Moved)
+	}
+	if _, ok := result.MatchedLeaseIDs["active-lease"]; !ok {
+		t.Fatalf("matched lease IDs = %v, want active-lease", result.MatchedLeaseIDs)
+	}
+	if _, ok := result.MatchedLeaseIDs["orphan-lease"]; ok {
+		t.Fatalf("matched stale orphan lease in %v", result.MatchedLeaseIDs)
 	}
 	if got := backend.Stats(); got.Ready != 1 || got.Processing != 1 {
 		t.Fatalf("stats after orphan recovery = %+v, want ready=1 processing=1", got)
 	}
-	if err := backend.Complete(active.ID); err != nil {
+	if err := backend.Complete(active.ID, "active-lease"); err != nil {
 		t.Fatalf("complete active task after orphan recovery returned error: %v", err)
 	}
 
-	recovered, err := backend.Acquire()
+	recovered, err := backend.Acquire("recovered-lease")
 	if err != nil {
 		t.Fatalf("acquire recovered orphan returned error: %v", err)
 	}
@@ -258,12 +321,12 @@ func testDeadLetterMovesProcessingTaskToDead(t *testing.T, factory backendFactor
 	if err := backend.Enqueue(task.Task{ID: "task-1", Attempts: 1}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := backend.DeadLetter(acquired.ID, "expired"); err != nil {
+	if err := backend.DeadLetter(acquired.ID, "lease-1", "expired"); err != nil {
 		t.Fatalf("dead letter returned error: %v", err)
 	}
 
@@ -276,8 +339,83 @@ func testDeadLetterMovesProcessingTaskToDead(t *testing.T, factory backendFactor
 func testDeadLetterMissingProcessingTaskFails(t *testing.T, factory backendFactory) {
 	backend := factory(t)
 
-	if err := backend.DeadLetter("missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := backend.DeadLetter("missing", "lease-missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("dead letter returned %v, want ErrTaskNotProcessing", err)
+	}
+}
+
+func testDeadLetterMismatchedLeaseFails(t *testing.T, factory backendFactory) {
+	backend := factory(t)
+	if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	acquired, err := backend.Acquire("lease-1")
+	if err != nil {
+		t.Fatalf("acquire returned error: %v", err)
+	}
+
+	if err := backend.DeadLetter(acquired.ID, "lease-2", "expired"); !errors.Is(err, ErrLeaseFenceMismatch) {
+		t.Fatalf("dead letter returned %v, want ErrLeaseFenceMismatch", err)
+	}
+	if got := backend.Stats(); got.Processing != 1 || got.Ready != 0 || got.Dead != 0 {
+		t.Fatalf("stats after mismatched dead letter = %+v, want ready=0 processing=1 dead=0", got)
+	}
+	if err := backend.Complete(acquired.ID, "lease-1"); err != nil {
+		t.Fatalf("complete after mismatched dead letter returned error: %v", err)
+	}
+}
+
+func testOldLeaseCannotMutateCurrentLease(t *testing.T, factory backendFactory) {
+	for _, tc := range []struct {
+		name       string
+		transition func(Backend, string) error
+	}{
+		{
+			name: "Complete",
+			transition: func(backend Backend, taskID string) error {
+				return backend.Complete(taskID, "lease-1")
+			},
+		},
+		{
+			name: "Requeue",
+			transition: func(backend Backend, taskID string) error {
+				return backend.Requeue(taskID, "lease-1")
+			},
+		},
+		{
+			name: "DeadLetter",
+			transition: func(backend Backend, taskID string) error {
+				return backend.DeadLetter(taskID, "lease-1", "expired")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := factory(t)
+			if err := backend.Enqueue(task.Task{ID: "task-1"}); err != nil {
+				t.Fatalf("enqueue returned error: %v", err)
+			}
+			oldLease, err := backend.Acquire("lease-1")
+			if err != nil {
+				t.Fatalf("acquire old lease returned error: %v", err)
+			}
+			if err := backend.Requeue(oldLease.ID, "lease-1"); err != nil {
+				t.Fatalf("requeue old lease returned error: %v", err)
+			}
+			currentLease, err := backend.Acquire("lease-2")
+			if err != nil {
+				t.Fatalf("acquire current lease returned error: %v", err)
+			}
+
+			if err := tc.transition(backend, currentLease.ID); !errors.Is(err, ErrLeaseFenceMismatch) {
+				t.Fatalf("stale %s returned %v, want ErrLeaseFenceMismatch", tc.name, err)
+			}
+			if got := backend.Stats(); got.Ready != 0 || got.Processing != 1 || got.Dead != 0 {
+				t.Fatalf("stats after stale %s = %+v, want ready=0 processing=1 dead=0", tc.name, got)
+			}
+			if err := backend.Complete(currentLease.ID, "lease-2"); err != nil {
+				t.Fatalf("complete current lease returned error: %v", err)
+			}
+		})
 	}
 }
 
@@ -297,14 +435,14 @@ func testStatsReportsReadyAndProcessing(t *testing.T, factory backendFactory) {
 		t.Fatalf("stats after enqueue = %+v, want ready=2 processing=0 dead=0", got)
 	}
 
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 	if got := backend.Stats(); got.Ready != 1 || got.Processing != 1 || got.Dead != 0 {
 		t.Fatalf("stats after acquire = %+v, want ready=1 processing=1 dead=0", got)
 	}
-	if err := backend.Complete(acquired.ID); err != nil {
+	if err := backend.Complete(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("complete returned error: %v", err)
 	}
 	if got := backend.Stats(); got.Ready != 1 || got.Processing != 0 || got.Dead != 0 {
@@ -327,13 +465,13 @@ func testPayloadCloningPreventsExternalMutation(t *testing.T, factory backendFac
 	}
 	original.Payload[0] = 'P'
 
-	acquired, err := backend.Acquire()
+	acquired, err := backend.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 	acquired.Payload[1] = 'A'
 
-	again, err := backend.Acquire()
+	again, err := backend.Acquire("lease-2")
 	if err != nil {
 		t.Fatalf("second acquire returned error: %v", err)
 	}
@@ -341,18 +479,18 @@ func testPayloadCloningPreventsExternalMutation(t *testing.T, factory backendFac
 		t.Fatalf("payload = %q, want %q", again.Payload, "payload")
 	}
 
-	if err := backend.Requeue(again.ID); err != nil {
+	if err := backend.Requeue(again.ID, "lease-2"); err != nil {
 		t.Fatalf("requeue returned error: %v", err)
 	}
-	requeued, err := backend.Acquire()
+	requeued, err := backend.Acquire("lease-3")
 	if err != nil {
 		t.Fatalf("acquire requeued task returned error: %v", err)
 	}
 	requeued.Payload[2] = 'Y'
-	if err := backend.Requeue(requeued.ID); err != nil {
+	if err := backend.Requeue(requeued.ID, "lease-3"); err != nil {
 		t.Fatalf("second requeue returned error: %v", err)
 	}
-	final, err := backend.Acquire()
+	final, err := backend.Acquire("lease-4")
 	if err != nil {
 		t.Fatalf("final acquire returned error: %v", err)
 	}
@@ -372,7 +510,7 @@ func testFIFOPreserved(t *testing.T, factory backendFactory) {
 
 	for i := 1; i <= 3; i++ {
 		want := fmt.Sprintf("task-%d", i)
-		got, err := backend.Acquire()
+		got, err := backend.Acquire(fmt.Sprintf("lease-%d", i))
 		if err != nil {
 			t.Fatalf("acquire %d returned error: %v", i, err)
 		}

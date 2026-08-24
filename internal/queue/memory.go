@@ -11,15 +11,20 @@ import (
 type MemoryQueue struct {
 	mu         sync.Mutex
 	ready      []task.Task
-	processing map[string]task.Task
+	processing map[string]memoryProcessingEntry
 	dead       []DeadTask
+}
+
+type memoryProcessingEntry struct {
+	task    task.Task
+	leaseID string
 }
 
 // NewMemoryQueue creates an empty in-memory queue backend.
 func NewMemoryQueue() *MemoryQueue {
 	return &MemoryQueue{
 		ready:      make([]task.Task, 0),
-		processing: make(map[string]task.Task),
+		processing: make(map[string]memoryProcessingEntry),
 		dead:       make([]DeadTask, 0),
 	}
 }
@@ -34,7 +39,7 @@ func (q *MemoryQueue) Enqueue(task task.Task) error {
 }
 
 // Acquire moves one ready task into processing storage.
-func (q *MemoryQueue) Acquire() (task.Task, error) {
+func (q *MemoryQueue) Acquire(leaseID string) (task.Task, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -47,18 +52,25 @@ func (q *MemoryQueue) Acquire() (task.Task, error) {
 	last := len(q.ready) - 1
 	q.ready[last] = task.Task{}
 	q.ready = q.ready[:last]
-	q.processing[next.ID] = cloneTask(next)
+	q.processing[next.ID] = memoryProcessingEntry{
+		task:    cloneTask(next),
+		leaseID: leaseID,
+	}
 
 	return cloneTask(next), nil
 }
 
 // Complete removes a processing task.
-func (q *MemoryQueue) Complete(taskID string) error {
+func (q *MemoryQueue) Complete(taskID, leaseID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if _, ok := q.processing[taskID]; !ok {
+	entry, ok := q.processing[taskID]
+	if !ok {
 		return ErrTaskNotProcessing
+	}
+	if entry.leaseID != leaseID {
+		return ErrLeaseFenceMismatch
 	}
 
 	delete(q.processing, taskID)
@@ -66,16 +78,20 @@ func (q *MemoryQueue) Complete(taskID string) error {
 }
 
 // Requeue moves a processing task back to ready storage.
-func (q *MemoryQueue) Requeue(taskID string) error {
+func (q *MemoryQueue) Requeue(taskID, leaseID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	task, ok := q.processing[taskID]
+	entry, ok := q.processing[taskID]
 	if !ok {
 		return ErrTaskNotProcessing
 	}
+	if entry.leaseID != leaseID {
+		return ErrLeaseFenceMismatch
+	}
 
 	delete(q.processing, taskID)
+	task := entry.task
 	task.Attempts++
 	q.ready = append(q.ready, cloneTask(task))
 	return nil
@@ -84,33 +100,43 @@ func (q *MemoryQueue) Requeue(taskID string) error {
 // RecoverOrphanedProcessing returns processing tasks without a recovered active
 // lease to ready storage. These tasks were acquired by the backend but never
 // durably leased, so returning them must not burn a retry attempt.
-func (q *MemoryQueue) RecoverOrphanedProcessing(activeTaskIDs map[string]struct{}) (int, error) {
+func (q *MemoryQueue) RecoverOrphanedProcessing(activeLeases []LeaseFence) (RecoveryResult, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	moved := 0
-	for taskID, task := range q.processing {
-		if _, active := activeTaskIDs[taskID]; active {
+	active := make(map[LeaseFence]struct{}, len(activeLeases))
+	for _, lease := range activeLeases {
+		active[lease] = struct{}{}
+	}
+
+	result := RecoveryResult{MatchedLeaseIDs: make(map[string]struct{})}
+	for taskID, entry := range q.processing {
+		if _, ok := active[LeaseFence{TaskID: taskID, LeaseID: entry.leaseID}]; ok {
+			result.MatchedLeaseIDs[entry.leaseID] = struct{}{}
 			continue
 		}
 		delete(q.processing, taskID)
-		q.ready = append(q.ready, cloneTask(task))
-		moved++
+		q.ready = append(q.ready, cloneTask(entry.task))
+		result.Moved++
 	}
-	return moved, nil
+	return result, nil
 }
 
 // DeadLetter moves a processing task into dead-letter storage.
-func (q *MemoryQueue) DeadLetter(taskID string, reason string) error {
+func (q *MemoryQueue) DeadLetter(taskID, leaseID, reason string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	task, ok := q.processing[taskID]
+	entry, ok := q.processing[taskID]
 	if !ok {
 		return ErrTaskNotProcessing
 	}
+	if entry.leaseID != leaseID {
+		return ErrLeaseFenceMismatch
+	}
 
 	delete(q.processing, taskID)
+	task := entry.task
 	task.Attempts++
 	q.dead = append(q.dead, DeadTask{
 		Task:   cloneTask(task),

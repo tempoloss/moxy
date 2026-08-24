@@ -15,6 +15,8 @@ var (
 	ErrInvalidTimeout   = errors.New("invalid timeout")
 )
 
+const maxLeaseTimeoutMS int64 = 86_400_000
+
 // Response is the command-layer result shape shared by all supported commands.
 type Response struct {
 	OK        bool
@@ -71,6 +73,9 @@ func (h *Handler) handleFetch(args []string) (Response, error) {
 
 	timeoutMS, err := strconv.ParseInt(args[1], 10, 64)
 	if err != nil {
+		return Response{}, ErrInvalidTimeout
+	}
+	if timeoutMS < 1 || timeoutMS > maxLeaseTimeoutMS {
 		return Response{}, ErrInvalidTimeout
 	}
 

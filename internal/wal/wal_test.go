@@ -218,6 +218,8 @@ func TestLiveFoldsClosedLeasesAway(t *testing.T) {
 		{Op: OpExpire, LeaseID: "lease-3"},
 		fetchRecord("lease-4", "task-4"),
 		{Op: OpDeadLetter, LeaseID: "lease-4"},
+		fetchRecord("lease-5", "task-5"),
+		{Op: OpStale, LeaseID: "lease-5"},
 	}
 
 	live := Live(records)

@@ -34,7 +34,7 @@ func TestFetchCrashBoundaryBeforeBackendAcquireLeavesTaskReady(t *testing.T) {
 
 func TestFetchCrashBoundaryAfterBackendAcquireBeforeJournalRequeuesOrphan(t *testing.T) {
 	backend, path := crashMatrixBackendWithTask(t, "fetch-before-journal")
-	task := crashMatrixAcquire(t, backend)
+	task := crashMatrixAcquire(t, backend, "lease-before-journal")
 
 	recovered, log := crashMatrixRestart(t, backend, path)
 	defer crashMatrixCloseLog(t, log)
@@ -58,7 +58,7 @@ func TestFetchCrashBoundaryAfterBackendAcquireBeforeJournalRequeuesOrphan(t *tes
 
 func TestFetchCrashBoundaryAfterAppendBeforeFsyncRestoresIfRecordSurvives(t *testing.T) {
 	backend, path := crashMatrixBackendWithTask(t, "fetch-unsynced-survived")
-	task := crashMatrixAcquire(t, backend)
+	task := crashMatrixAcquire(t, backend, "lease-unsynced-fetch")
 	record := crashMatrixFetchRecord("lease-unsynced-fetch", task, time.Minute)
 	log := crashMatrixOpenLog(t, path, false)
 	if err := log.Append(record); err != nil {
@@ -76,7 +76,7 @@ func TestFetchCrashBoundaryAfterAppendBeforeFsyncRestoresIfRecordSurvives(t *tes
 
 func TestFetchCrashBoundaryAfterFsyncBeforeMemoryPublishRestoresOriginalDeadline(t *testing.T) {
 	backend, path := crashMatrixBackendWithTask(t, "fetch-fsynced-before-publish")
-	task := crashMatrixAcquire(t, backend)
+	task := crashMatrixAcquire(t, backend, "lease-fsynced-fetch")
 	record := crashMatrixFetchRecord("lease-fsynced-fetch", task, 10*time.Second)
 	log := crashMatrixOpenLog(t, path, true)
 	if err := log.Append(record); err != nil {
@@ -94,7 +94,7 @@ func TestFetchCrashBoundaryAfterFsyncBeforeMemoryPublishRestoresOriginalDeadline
 
 func TestRecoveryReconciliationKeepsRecoveredLeaseUntilOriginalDeadline(t *testing.T) {
 	backend, path := crashMatrixBackendWithTask(t, "fetch-recovered-deadline")
-	task := crashMatrixAcquire(t, backend)
+	task := crashMatrixAcquire(t, backend, "lease-recovered-deadline")
 	record := crashMatrixFetchRecord("lease-recovered-deadline", task, time.Minute)
 	log := crashMatrixOpenLog(t, path, true)
 	if err := log.Append(record); err != nil {
@@ -144,27 +144,26 @@ func TestAckCrashBoundaryBeforeBackendCompleteKeepsLeaseRetryable(t *testing.T) 
 	crashMatrixRequirePlacement(t, recovered, 0, 0, 0)
 }
 
-func TestAckCrashBoundaryAfterBackendCompleteBeforeJournalIsReconciledByReaper(t *testing.T) {
+func TestAckCrashBoundaryAfterBackendCompleteBeforeJournalIsReconciledAtStartup(t *testing.T) {
 	backend, path, lease, log := crashMatrixFetchedLease(t, "ack-before-journal", time.Second)
 	crashMatrixCloseLog(t, log)
-	if err := backend.Complete(lease.Task.ID); err != nil {
+	if err := backend.Complete(lease.Task.ID, lease.LeaseID); err != nil {
 		t.Fatalf("manual complete returned error: %v", err)
 	}
 
 	recovered, recoveredLog := crashMatrixRestart(t, backend, path)
-	crashMatrixRequirePlacement(t, recovered, 0, 0, 1)
-	if err := recovered.Ack(lease.LeaseID); !errors.Is(err, queue.ErrTaskNotProcessing) {
-		t.Fatalf("retry ack error = %v, want %v", err, queue.ErrTaskNotProcessing)
+	crashMatrixRequirePlacement(t, recovered, 0, 0, 0)
+	if err := recovered.Ack(lease.LeaseID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("retry ack error = %v, want %v", err, ErrLeaseNotFound)
 	}
 
 	reaped, err := recovered.ReapExpired(lease.ExpiresAt.Add(time.Nanosecond))
 	if err != nil {
 		t.Fatalf("reap returned error: %v", err)
 	}
-	if reaped != 1 {
-		t.Fatalf("reaped %d leases, want 1", reaped)
+	if reaped != 0 {
+		t.Fatalf("reaped %d leases, want 0", reaped)
 	}
-	crashMatrixRequirePlacement(t, recovered, 0, 0, 0)
 	crashMatrixCloseLog(t, recoveredLog)
 
 	restartedAgain, finalLog := crashMatrixRestart(t, backend, path)
@@ -175,7 +174,7 @@ func TestAckCrashBoundaryAfterBackendCompleteBeforeJournalIsReconciledByReaper(t
 func TestAckCrashBoundaryAfterAppendBeforeFsyncClosesIfRecordSurvives(t *testing.T) {
 	backend, path, lease, log := crashMatrixFetchedLease(t, "ack-unsynced-survived", time.Minute)
 	crashMatrixCloseLog(t, log)
-	if err := backend.Complete(lease.Task.ID); err != nil {
+	if err := backend.Complete(lease.Task.ID, lease.LeaseID); err != nil {
 		t.Fatalf("manual complete returned error: %v", err)
 	}
 	ackLog := crashMatrixOpenLog(t, path, false)
@@ -193,7 +192,7 @@ func TestAckCrashBoundaryAfterAppendBeforeFsyncClosesIfRecordSurvives(t *testing
 func TestAckCrashBoundaryAfterFsyncBeforeMemoryDeleteKeepsTaskCompleted(t *testing.T) {
 	backend, path, lease, log := crashMatrixFetchedLease(t, "ack-fsynced-before-delete", time.Minute)
 	crashMatrixCloseLog(t, log)
-	if err := backend.Complete(lease.Task.ID); err != nil {
+	if err := backend.Complete(lease.Task.ID, lease.LeaseID); err != nil {
 		t.Fatalf("manual complete returned error: %v", err)
 	}
 	ackLog := crashMatrixOpenLog(t, path, true)
@@ -237,7 +236,7 @@ func TestTornFinalFetchRecordIsDroppedAndOrphanedTaskIsRequeued(t *testing.T) {
 	if err := backend.Enqueue(Task{ID: "task-torn", Payload: []byte("fetch-torn")}); err != nil {
 		t.Fatalf("enqueue torn task returned error: %v", err)
 	}
-	intactTask := crashMatrixAcquire(t, backend)
+	intactTask := crashMatrixAcquire(t, backend, "lease-intact")
 	intactRecord := crashMatrixFetchRecord("lease-intact", intactTask, time.Second)
 	log := crashMatrixOpenLog(t, path, true)
 	if err := log.Append(intactRecord); err != nil {
@@ -246,7 +245,7 @@ func TestTornFinalFetchRecordIsDroppedAndOrphanedTaskIsRequeued(t *testing.T) {
 	goodOffset := log.Size()
 	crashMatrixCloseLog(t, log)
 
-	tornTask := crashMatrixAcquire(t, backend)
+	tornTask := crashMatrixAcquire(t, backend, "lease-torn")
 	tornRecord := crashMatrixFetchRecord("lease-torn", tornTask, time.Second)
 	crashMatrixAppendTornRecord(t, path, tornRecord)
 
@@ -285,36 +284,45 @@ func TestTornFinalFetchRecordIsDroppedAndOrphanedTaskIsRequeued(t *testing.T) {
 func TestTornFinalAckRecordIsDroppedAndReaperDoesNotResurrectCompletedTask(t *testing.T) {
 	backend, path, lease, log := crashMatrixFetchedLease(t, "ack-torn", time.Second)
 	crashMatrixCloseLog(t, log)
-	if err := backend.Complete(lease.Task.ID); err != nil {
+	if err := backend.Complete(lease.Task.ID, lease.LeaseID); err != nil {
 		t.Fatalf("manual complete returned error: %v", err)
-	}
-	beforeTorn, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat WAL before torn append returned error: %v", err)
 	}
 	crashMatrixAppendTornRecord(t, path, wal.Record{Op: wal.OpAck, LeaseID: lease.LeaseID})
 
 	recovered, recoveredLog := crashMatrixRestart(t, backend, path)
-	defer crashMatrixCloseLog(t, recoveredLog)
 
-	crashMatrixRequirePlacement(t, recovered, 0, 0, 1)
-	if size := recoveredLog.Size(); size != beforeTorn.Size() {
-		t.Fatalf("recovered WAL size = %d, want truncation to last good offset %d", size, beforeTorn.Size())
-	}
+	crashMatrixRequirePlacement(t, recovered, 0, 0, 0)
 	reaped, err := recovered.ReapExpired(lease.ExpiresAt.Add(time.Nanosecond))
 	if err != nil {
 		t.Fatalf("reap returned error: %v", err)
 	}
-	if reaped != 1 {
-		t.Fatalf("reaped %d leases, want 1", reaped)
+	if reaped != 0 {
+		t.Fatalf("reaped %d leases, want 0", reaped)
 	}
 	crashMatrixRequirePlacement(t, recovered, 0, 0, 0)
+	crashMatrixCloseLog(t, recoveredLog)
+
+	reopened := crashMatrixOpenLog(t, path, true)
+	defer crashMatrixCloseLog(t, reopened)
+	records := reopened.Recovered()
+	if len(records) != 2 {
+		t.Fatalf("recovered WAL records = %d, want fetch plus stale", len(records))
+	}
+	if records[0].Op != wal.OpFetch || records[0].LeaseID != lease.LeaseID {
+		t.Fatalf("first recovered record = %+v, want fetch for %s", records[0], lease.LeaseID)
+	}
+	if records[1].Op != wal.OpStale || records[1].LeaseID != lease.LeaseID {
+		t.Fatalf("second recovered record = %+v, want stale for %s", records[1], lease.LeaseID)
+	}
+	if live := wal.Live(records); len(live) != 0 {
+		t.Fatalf("live WAL after torn ack recovery = %v, want empty", live)
+	}
 }
 
 func TestRecoveryReconciliationDoesNotResurrectDurablyAckedTask(t *testing.T) {
 	backend, path, lease, log := crashMatrixFetchedLease(t, "ack-durable-reconciliation", time.Minute)
 	crashMatrixCloseLog(t, log)
-	if err := backend.Complete(lease.Task.ID); err != nil {
+	if err := backend.Complete(lease.Task.ID, lease.LeaseID); err != nil {
 		t.Fatalf("manual complete returned error: %v", err)
 	}
 	ackLog := crashMatrixOpenLog(t, path, true)
@@ -377,9 +385,9 @@ func crashMatrixCloseLog(t *testing.T, log *wal.Log) {
 	}
 }
 
-func crashMatrixAcquire(t *testing.T, backend queue.Backend) Task {
+func crashMatrixAcquire(t *testing.T, backend queue.Backend, leaseID string) Task {
 	t.Helper()
-	task, err := backend.Acquire()
+	task, err := backend.Acquire(leaseID)
 	if err != nil {
 		t.Fatalf("manual acquire returned error: %v", err)
 	}

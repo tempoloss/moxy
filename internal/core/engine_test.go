@@ -553,6 +553,91 @@ func TestReapExpiredRetriesFailedBackendRequeueLater(t *testing.T) {
 	}
 }
 
+func TestAmbiguousPostApplyExpiryRetryDoesNotStealNewLease(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		retry func(*testing.T, *Engine, *Lease, time.Time)
+	}{
+		{
+			name: "AckOldLease",
+			retry: func(t *testing.T, engine *Engine, lease *Lease, _ time.Time) {
+				t.Helper()
+				if err := engine.Ack(lease.LeaseID); err != nil && !errors.Is(err, ErrLeaseNotFound) {
+					t.Fatalf("ack old lease returned error: %v", err)
+				}
+			},
+		},
+		{
+			name: "ReapOldLease",
+			retry: func(t *testing.T, engine *Engine, _ *Lease, retryAt time.Time) {
+				t.Helper()
+				if _, err := engine.ReapExpired(retryAt); err != nil {
+					t.Fatalf("reap old lease returned error: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, oldLease, currentLease, retryAt := startPostApplyRequeueAmbiguity(t)
+
+			tc.retry(t, engine, oldLease, retryAt)
+			assertCurrentLeaseStillProcessingAndAckable(t, engine, currentLease)
+		})
+	}
+}
+
+func startPostApplyRequeueAmbiguity(t *testing.T) (*Engine, *Lease, *Lease, time.Time) {
+	t.Helper()
+
+	backend := &postApplyRequeueErrorBackend{Backend: queue.NewMemoryQueue()}
+	engine := NewEngineWithBackendAndConfig(backend, EngineConfig{RequeueRetryDelay: time.Second})
+	task := enqueue(t, engine, []byte("ambiguous"))
+
+	oldLease, err := engine.Fetch(time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch old lease returned error: %v", err)
+	}
+
+	firstReapAt := oldLease.ExpiresAt.Add(time.Nanosecond)
+	requeued, err := engine.ReapExpired(firstReapAt)
+	if !errors.Is(err, errPostApplyRequeue) {
+		t.Fatalf("first reap error = %v, want errPostApplyRequeue", err)
+	}
+	if requeued != 0 {
+		t.Fatalf("first reap count = %d, want 0", requeued)
+	}
+
+	currentLease, err := engine.Fetch(time.Minute)
+	if err != nil {
+		t.Fatalf("fetch current lease returned error: %v", err)
+	}
+	if currentLease.Task.ID != task.ID {
+		t.Fatalf("current task ID = %q, want %q", currentLease.Task.ID, task.ID)
+	}
+	if currentLease.LeaseID == oldLease.LeaseID {
+		t.Fatalf("current lease reused old lease ID %q", currentLease.LeaseID)
+	}
+
+	return engine, oldLease, currentLease, firstReapAt.Add(2 * time.Second)
+}
+
+func assertCurrentLeaseStillProcessingAndAckable(t *testing.T, engine *Engine, lease *Lease) {
+	t.Helper()
+
+	stats := engine.Stats()
+	if stats.Ready != 0 || stats.Processing != 1 || stats.ActiveLeases != 1 {
+		t.Fatalf("stats after old lease retry = %+v, want ready=0 processing=1 active=1", stats)
+	}
+	if err := engine.Ack(lease.LeaseID); err != nil {
+		t.Fatalf("ack current lease returned error: %v", err)
+	}
+
+	stats = engine.Stats()
+	if stats.Ready != 0 || stats.Processing != 0 || stats.ActiveLeases != 0 || stats.Dead != 0 {
+		t.Fatalf("stats after current ack = %+v, want ready=0 processing=0 active=0 dead=0", stats)
+	}
+}
+
 func TestReapExpiredDoesNotDeleteLeaseIfBackendDeadLetterFails(t *testing.T) {
 	backend := queue.NewMemoryQueue()
 	engine := NewEngineWithBackendAndConfig(backend, EngineConfig{MaxAttempts: 1})
@@ -702,6 +787,8 @@ func TestMultipleLeaseExpirationOrdering(t *testing.T) {
 }
 
 var errRequeueFailed = errors.New("requeue failed")
+var errPostApplyRequeue = errors.New("post-apply requeue failed")
+
 var errEnqueueFailed = errors.New("enqueue failed")
 
 func enqueue(t *testing.T, engine *Engine, payload []byte) Task {
@@ -726,7 +813,7 @@ type failingRequeueBackend struct {
 	queue.Backend
 }
 
-func (b *failingRequeueBackend) Requeue(taskID string) error {
+func (b *failingRequeueBackend) Requeue(taskID, leaseID string) error {
 	return errRequeueFailed
 }
 
@@ -735,13 +822,30 @@ type failOnceRequeueBackend struct {
 	failed bool
 }
 
-func (b *failOnceRequeueBackend) Requeue(taskID string) error {
+func (b *failOnceRequeueBackend) Requeue(taskID, leaseID string) error {
 	if !b.failed {
 		b.failed = true
 		return errRequeueFailed
 	}
 
-	return b.Backend.Requeue(taskID)
+	return b.Backend.Requeue(taskID, leaseID)
+}
+
+type postApplyRequeueErrorBackend struct {
+	queue.Backend
+	failed bool
+}
+
+func (b *postApplyRequeueErrorBackend) Requeue(taskID, leaseID string) error {
+	if err := b.Backend.Requeue(taskID, leaseID); err != nil {
+		return err
+	}
+	if !b.failed {
+		b.failed = true
+		return errPostApplyRequeue
+	}
+
+	return nil
 }
 
 var errDeadLetterFailed = errors.New("dead letter failed")
@@ -750,7 +854,7 @@ type failingDeadLetterBackend struct {
 	queue.Backend
 }
 
-func (b *failingDeadLetterBackend) DeadLetter(taskID string, reason string) error {
+func (b *failingDeadLetterBackend) DeadLetter(taskID, leaseID string, reason string) error {
 	return errDeadLetterFailed
 }
 
@@ -759,11 +863,11 @@ type failOnceDeadLetterBackend struct {
 	failed bool
 }
 
-func (b *failOnceDeadLetterBackend) DeadLetter(taskID string, reason string) error {
+func (b *failOnceDeadLetterBackend) DeadLetter(taskID, leaseID string, reason string) error {
 	if !b.failed {
 		b.failed = true
 		return errDeadLetterFailed
 	}
 
-	return b.Backend.DeadLetter(taskID, reason)
+	return b.Backend.DeadLetter(taskID, leaseID, reason)
 }

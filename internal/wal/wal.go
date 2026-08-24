@@ -1,7 +1,7 @@
 // Package wal implements an append-only journal of lease transitions.
 //
-// The engine's authoritative lease state — which worker holds which task and
-// when that claim expires — lives in memory. Without a journal a restart loses
+// The engine's authoritative lease state - which worker holds which task and
+// when that claim expires - lives in memory. Without a journal a restart loses
 // it, and every task already moved into the backend's processing set is
 // stranded there: the reaper walks the in-memory expiration heap, so a lease it
 // never saw is a lease it can never expire.
@@ -14,7 +14,7 @@
 // A crash can tear the final frame. Replay stops at the first frame that is
 // short, fails its checksum, or does not decode, and the file is truncated back
 // to the last good boundary. A half-written record is therefore discarded
-// rather than poisoning recovery.
+// instead of poisoning recovery.
 package wal
 
 import (
@@ -46,6 +46,7 @@ const (
 	OpAck        Op = "ack"
 	OpExpire     Op = "expire"
 	OpDeadLetter Op = "dead_letter"
+	OpStale      Op = "stale"
 )
 
 // Record is one lease transition. Only OpFetch carries task and timing detail;
@@ -83,12 +84,12 @@ func Open(path string) (*Log, error) {
 // OpenWith is Open with explicit durability options.
 func OpenWith(path string, options Options) (*Log, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("wal: create directory: %w", err)
 		}
 	}
 
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("wal: open %s: %w", path, err)
 	}
@@ -162,7 +163,7 @@ func (l *Log) Compact() error {
 	sort.Strings(ids)
 
 	temporary := l.path + ".compact"
-	file, err := os.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := os.OpenFile(temporary, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("wal: open compaction file: %w", err)
 	}
@@ -202,7 +203,7 @@ func (l *Log) Compact() error {
 		return fmt.Errorf("wal: replace journal: %w", err)
 	}
 
-	reopened, err := os.OpenFile(l.path, os.O_RDWR|os.O_APPEND, 0o644)
+	reopened, err := os.OpenFile(l.path, os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return fmt.Errorf("wal: reopen compacted journal: %w", err)
 	}
@@ -232,7 +233,7 @@ func Live(records []Record) map[string]Record {
 		switch record.Op {
 		case OpFetch:
 			live[record.LeaseID] = record
-		case OpAck, OpExpire, OpDeadLetter:
+		case OpAck, OpExpire, OpDeadLetter, OpStale:
 			delete(live, record.LeaseID)
 		}
 	}

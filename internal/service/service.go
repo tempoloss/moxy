@@ -2,7 +2,6 @@ package service
 
 import (
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,14 +11,19 @@ import (
 	"github.com/tempoloss/moxy/internal/wal"
 )
 
-var ErrInvalidQueueName = errors.New("queue name must not be empty")
+var (
+	ErrInvalidQueueName = errors.New("queue name must use 1-64 letters, digits, hyphen or underscore")
+	ErrTooManyQueues    = errors.New("too many queues")
+)
+
+const defaultMaxQueues = 1024
 
 // BackendFactory creates a queue backend for one named queue.
 type BackendFactory func(queueName string) queue.Backend
 
 // JournalFactory opens the lease journal for one named queue and returns any
 // lease state recovered from it. Each queue needs its own journal, so this is a
-// factory rather than a single shared handle.
+// per-queue factory, not a single shared handle.
 type JournalFactory func(queueName string) (core.Journal, []wal.Record, error)
 
 // Stats reports the state of one service-managed queue.
@@ -30,7 +34,8 @@ type ServiceConfig struct {
 	Engine core.EngineConfig
 	// Journal, when set, gives every queue a durable lease journal. Leaving it
 	// nil keeps lease state in memory only.
-	Journal JournalFactory
+	Journal   JournalFactory
+	MaxQueues int
 }
 
 // Service owns multiple named queues.
@@ -136,6 +141,10 @@ func (s *Service) engineFor(queueName string) (*core.Engine, error) {
 		return engine, nil
 	}
 
+	if maxQueues := s.maxQueues(); maxQueues > 0 && len(s.engines) >= maxQueues {
+		return nil, ErrTooManyQueues
+	}
+
 	config := s.config.Engine
 	if s.config.Journal != nil {
 		journal, recovered, err := s.config.Journal(queueName)
@@ -151,6 +160,13 @@ func (s *Service) engineFor(queueName string) (*core.Engine, error) {
 	return engine, nil
 }
 
+func (s *Service) maxQueues() int {
+	if s.config.MaxQueues == 0 {
+		return defaultMaxQueues
+	}
+	return s.config.MaxQueues
+}
+
 func (s *Service) existingEngines() []*core.Engine {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,5 +179,15 @@ func (s *Service) existingEngines() []*core.Engine {
 }
 
 func validQueueName(queueName string) bool {
-	return strings.TrimSpace(queueName) != ""
+	if queueName == "" || len(queueName) > 64 {
+		return false
+	}
+	for _, r := range queueName {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }

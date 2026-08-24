@@ -47,12 +47,12 @@ func TestMemoryQueueDeadLetterMovesTaskFromProcessingToDead(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1", Payload: []byte("payload")}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+	if err := queue.DeadLetter(acquired.ID, "lease-1", "expired"); err != nil {
 		t.Fatalf("dead letter returned error: %v", err)
 	}
 
@@ -73,7 +73,7 @@ func TestMemoryQueueDeadLetterMovesTaskFromProcessingToDead(t *testing.T) {
 func TestMemoryQueueDeadLetterMissingTaskReturnsErrTaskNotProcessing(t *testing.T) {
 	queue := NewMemoryQueue()
 
-	if err := queue.DeadLetter("missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.DeadLetter("missing", "lease-missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("dead letter returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -84,13 +84,13 @@ func TestMemoryQueueDeadLetterClonesPayload(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1", Payload: payload}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 	acquired.Payload[0] = 'P'
 
-	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+	if err := queue.DeadLetter(acquired.ID, "lease-1", "expired"); err != nil {
 		t.Fatalf("dead letter returned error: %v", err)
 	}
 

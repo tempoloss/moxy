@@ -2,14 +2,15 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tempoloss/moxy/internal/queue"
 	"github.com/redis/go-redis/v9"
+	"github.com/tempoloss/moxy/internal/queue"
 )
 
 func TestRedisQueueEngineIntegration(t *testing.T) {
@@ -94,6 +95,61 @@ func TestRedisQueueEngineIntegration(t *testing.T) {
 	}
 }
 
+func TestRedisQueueEngineStaleLeaseCannotMutateCurrentLease(t *testing.T) {
+	if os.Getenv("MOXY_REDIS_INTEGRATION") != "1" {
+		t.Skip("set MOXY_REDIS_INTEGRATION=1 to run Redis integration tests")
+	}
+
+	addr := os.Getenv("MOXY_REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
+	}
+
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping redis at %s: %v", addr, err)
+	}
+
+	queueName := redisEngineQueueName(t)
+	backend := queue.NewRedisQueue(client, queueName)
+	cleanupRedisEngineQueue(t, client, queueName)
+	t.Cleanup(func() {
+		cleanupRedisEngineQueue(t, client, queueName)
+	})
+
+	engine := newEngine(backend)
+	if _, err := engine.Enqueue([]byte("payload")); err != nil {
+		t.Fatalf("enqueue returned error: %v", err)
+	}
+	oldLease, err := engine.Fetch(time.Millisecond)
+	if err != nil {
+		t.Fatalf("fetch old lease returned error: %v", err)
+	}
+	if err := backend.Requeue(oldLease.Task.ID, oldLease.LeaseID); err != nil {
+		t.Fatalf("manual requeue returned error: %v", err)
+	}
+	currentLease, err := engine.Fetch(time.Minute)
+	if err != nil {
+		t.Fatalf("fetch current lease returned error: %v", err)
+	}
+
+	if err := engine.Ack(oldLease.LeaseID); !errors.Is(err, ErrLeaseNotFound) {
+		t.Fatalf("ack old lease returned %v, want ErrLeaseNotFound", err)
+	}
+	if err := engine.Ack(currentLease.LeaseID); err != nil {
+		t.Fatalf("ack current lease returned error: %v", err)
+	}
+	if stats := engine.Stats(); stats.Ready != 0 || stats.Processing != 0 || stats.ActiveLeases != 0 {
+		t.Fatalf("stats after stale retry and current ack = %+v, want ready=0 processing=0 active=0", stats)
+	}
+}
+
 func redisEngineQueueName(t *testing.T) string {
 	name := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
 	return name + "-" + time.Now().Format("20060102150405.000000000")
@@ -106,8 +162,9 @@ func cleanupRedisEngineQueue(t *testing.T, client *redis.Client, queueName strin
 	defer cancel()
 	readyKey := fmt.Sprintf("moxy:{%s}:ready", queueName)
 	processingKey := fmt.Sprintf("moxy:{%s}:processing", queueName)
+	processingLeaseKey := fmt.Sprintf("moxy:{%s}:processing:leases", queueName)
 	deadKey := fmt.Sprintf("moxy:{%s}:dead", queueName)
-	if err := client.Del(ctx, readyKey, processingKey, deadKey).Err(); err != nil {
+	if err := client.Del(ctx, readyKey, processingKey, processingLeaseKey, deadKey).Err(); err != nil {
 		t.Fatalf("cleanup redis engine queue: %v", err)
 	}
 }

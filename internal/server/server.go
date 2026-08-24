@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/tempoloss/moxy/internal/command"
 	"github.com/tempoloss/moxy/internal/protocol"
@@ -15,7 +17,8 @@ import (
 
 // Config controls the TCP server.
 type Config struct {
-	Addr string
+	Addr     string
+	MaxConns int
 }
 
 // Server accepts RESP commands over TCP and dispatches them to a command handler.
@@ -30,6 +33,16 @@ type Server struct {
 
 func New(handler *command.Handler, cfg Config) *Server {
 	return &Server{handler: handler, cfg: cfg}
+}
+
+// EMFILE/ENFILE mean the process is out of descriptors; sleeping lets the
+// reaper close sockets before the daemon exits.
+func isTemporaryAccept(err error) bool {
+	if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -51,9 +64,28 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 	}()
 
+	var slots chan struct{}
+	if s.cfg.MaxConns > 0 {
+		slots = make(chan struct{}, s.cfg.MaxConns)
+	}
+
+	var delay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) && isTemporaryAccept(err) {
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay *= 2
+					if delay > time.Second {
+						delay = time.Second
+					}
+				}
+				slog.Warn("accept failed, retrying", "err", err, "delay", delay)
+				time.Sleep(delay)
+				continue
+			}
 			s.clearListener(listener)
 			s.wg.Wait()
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
@@ -61,10 +93,25 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			}
 			return err
 		}
+		delay = 0
+
+		if slots != nil {
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				conn.Close()
+				continue
+			}
+		}
 
 		s.wg.Add(1)
 		go func() {
-			defer s.wg.Done()
+			defer func() {
+				if slots != nil {
+					<-slots
+				}
+				s.wg.Done()
+			}()
 			s.handleConn(conn)
 		}()
 	}

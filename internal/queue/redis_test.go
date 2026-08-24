@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tempoloss/moxy/internal/task"
 	"github.com/redis/go-redis/v9"
+	"github.com/tempoloss/moxy/internal/task"
 )
 
 func TestRedisQueueContract(t *testing.T) {
@@ -27,7 +27,7 @@ func TestRedisQueueCompleteMissingTaskReturnsErrTaskNotProcessing(t *testing.T) 
 	client := redisClientForTest(t)
 	queue := redisQueueForTest(t, client)
 
-	if err := queue.Complete("missing"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.Complete("missing", "lease-missing"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("complete returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -36,7 +36,7 @@ func TestRedisQueueRequeueMissingTaskReturnsErrTaskNotProcessing(t *testing.T) {
 	client := redisClientForTest(t)
 	queue := redisQueueForTest(t, client)
 
-	if err := queue.Requeue("missing"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.Requeue("missing", "lease-missing"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("requeue returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -48,12 +48,12 @@ func TestRedisQueueRequeueMovesTaskFromProcessingToReady(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1", Payload: []byte("payload")}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.Requeue(acquired.ID); err != nil {
+	if err := queue.Requeue(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("requeue returned error: %v", err)
 	}
 	stats := queue.Stats()
@@ -69,12 +69,12 @@ func TestRedisQueueCompleteRemovesTaskFromProcessing(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.Complete(acquired.ID); err != nil {
+	if err := queue.Complete(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("complete returned error: %v", err)
 	}
 	stats := queue.Stats()
@@ -90,15 +90,15 @@ func TestRedisQueueRepeatedCompleteFailsCleanly(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.Complete(acquired.ID); err != nil {
+	if err := queue.Complete(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("first complete returned error: %v", err)
 	}
-	if err := queue.Complete(acquired.ID); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.Complete(acquired.ID, "lease-1"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("second complete returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -110,15 +110,15 @@ func TestRedisQueueRepeatedRequeueFailsCleanly(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.Requeue(acquired.ID); err != nil {
+	if err := queue.Requeue(acquired.ID, "lease-1"); err != nil {
 		t.Fatalf("first requeue returned error: %v", err)
 	}
-	if err := queue.Requeue(acquired.ID); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.Requeue(acquired.ID, "lease-1"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("second requeue returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -130,12 +130,12 @@ func TestRedisQueueDeadLetterMovesTaskToDeadKey(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1", Payload: []byte("payload")}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+	if err := queue.DeadLetter(acquired.ID, "lease-1", "expired"); err != nil {
 		t.Fatalf("dead letter returned error: %v", err)
 	}
 
@@ -156,7 +156,7 @@ func TestRedisQueueDeadLetterMissingTaskReturnsErrTaskNotProcessing(t *testing.T
 	client := redisClientForTest(t)
 	queue := redisQueueForTest(t, client)
 
-	if err := queue.DeadLetter("missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.DeadLetter("missing", "lease-missing", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("dead letter returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -168,15 +168,15 @@ func TestRedisQueueRepeatedDeadLetterFailsCleanly(t *testing.T) {
 	if err := queue.Enqueue(task.Task{ID: "task-1"}); err != nil {
 		t.Fatalf("enqueue returned error: %v", err)
 	}
-	acquired, err := queue.Acquire()
+	acquired, err := queue.Acquire("lease-1")
 	if err != nil {
 		t.Fatalf("acquire returned error: %v", err)
 	}
 
-	if err := queue.DeadLetter(acquired.ID, "expired"); err != nil {
+	if err := queue.DeadLetter(acquired.ID, "lease-1", "expired"); err != nil {
 		t.Fatalf("first dead letter returned error: %v", err)
 	}
-	if err := queue.DeadLetter(acquired.ID, "expired"); !errors.Is(err, ErrTaskNotProcessing) {
+	if err := queue.DeadLetter(acquired.ID, "lease-1", "expired"); !errors.Is(err, ErrTaskNotProcessing) {
 		t.Fatalf("second dead letter returned %v, want ErrTaskNotProcessing", err)
 	}
 }
@@ -196,11 +196,11 @@ func TestRedisQueueCachedScriptsRunRepeatedly(t *testing.T) {
 		if err := queue.Enqueue(task.Task{ID: id}); err != nil {
 			t.Fatalf("enqueue %s returned error: %v", id, err)
 		}
-		acquired, err := queue.Acquire()
+		acquired, err := queue.Acquire("lease-" + id)
 		if err != nil {
 			t.Fatalf("acquire %s returned error: %v", id, err)
 		}
-		if err := queue.Complete(acquired.ID); err != nil {
+		if err := queue.Complete(acquired.ID, "lease-"+id); err != nil {
 			t.Fatalf("complete %s returned error: %v", id, err)
 		}
 	}
@@ -209,11 +209,11 @@ func TestRedisQueueCachedScriptsRunRepeatedly(t *testing.T) {
 		if err := queue.Enqueue(task.Task{ID: id}); err != nil {
 			t.Fatalf("enqueue %s returned error: %v", id, err)
 		}
-		acquired, err := queue.Acquire()
+		acquired, err := queue.Acquire("lease-" + id)
 		if err != nil {
 			t.Fatalf("acquire %s returned error: %v", id, err)
 		}
-		if err := queue.Requeue(acquired.ID); err != nil {
+		if err := queue.Requeue(acquired.ID, "lease-"+id); err != nil {
 			t.Fatalf("requeue %s returned error: %v", id, err)
 		}
 	}
@@ -288,7 +288,7 @@ func cleanupRedisQueue(t *testing.T, client *redis.Client, queue *RedisQueue) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := client.Del(ctx, queue.readyKey, queue.processingKey, queue.deadKey).Err(); err != nil {
+	if err := client.Del(ctx, queue.readyKey, queue.processingKey, queue.processingLeaseKey, queue.deadKey).Err(); err != nil {
 		t.Fatalf("cleanup redis queue: %v", err)
 	}
 }
