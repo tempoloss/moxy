@@ -3,9 +3,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/an8kk/Moxy/actions/workflows/go.yml"><img alt="Go" src="https://github.com/an8kk/Moxy/actions/workflows/go.yml/badge.svg"></a>
-  <a href="https://goreportcard.com/report/github.com/an8kk/Moxy"><img alt="Go Report" src="https://goreportcard.com/badge/github.com/an8kk/Moxy"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/an8kk/Moxy"></a>
+  <a href="https://github.com/tempoloss/moxy/actions/workflows/go.yml"><img alt="Go" src="https://github.com/tempoloss/moxy/actions/workflows/go.yml/badge.svg"></a>
+  <a href="https://goreportcard.com/report/github.com/tempoloss/moxy"><img alt="Go Report" src="https://goreportcard.com/badge/github.com/tempoloss/moxy"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/tempoloss/moxy"></a>
   <img alt="Status" src="https://img.shields.io/badge/status-pre--proxy%20core-21d4a8">
 </p>
 
